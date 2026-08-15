@@ -1,3 +1,18 @@
+For tomorrow (08/16):
+
+(1) Reread the notes from Claude yesterday
+(2) Continue investigating the data (EDA on the columns)
+(3) Claude said:
+Three things queued for tomorrow, in the order I'd do them:
+
+1. The no-arb ladder check. Fast, and it upgrades Q1 from "spreads are wider here" to "the thin markets actually break consistency with the liquid ones." That's a much harder claim.
+2. Q2's uncertainty metric. You have the implied distribution at every instant — pick your measure (variance, entropy, or the interquartile width of the run distribution) and run it minute by minute. Remember to smooth before differencing; the raw PMF was visibly sawtoothed from tick noise.
+3. Q3 via RFI. The 428k top-of-book depth is the single biggest anomaly in the dataset and it sits in the most-traded market. Start there.
+
+One loose thread I'd not lose: the ~35s latency mode in genuine update rows, uniform across all four stat groups. The reconnect-backlog hypothesis is testable in about ten minutes — check whether delayed updates cluster right after snapshot bursts — and if it's confirmed you can filter it, which matters before you do any timing-sensitive work for Q3.
+
+
+
 # Background about the data & sports betting markets
 - The vendor is River Markets, which is a prime broker / unified execution layer for prediction markets - one API across venues, live on Kalshi, Polymarket, Polymarket.  They raised $8.5 million seed announced on Aug 11th, 2026
 - The ID native_id, such as KXMLBTOTAL-26AUG051940PITMIL-9, is one specific bet, such as "Will the Fed hike in September" or "Will the Giants win the Superbowl?".  One question, one order book, one price.  Prices are between 0 and 1, and correspond to an implied probability of the event happening. For instance, a price of 0.47 means the market believes there is a 47% chance that Fed will hike in Sept. If someone buys at 0.47, and the Fed does hike, he receives $1 and makes a profit of $0.43
