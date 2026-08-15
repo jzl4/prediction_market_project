@@ -1,0 +1,17 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files -- inputs and derived outputs, kept out of the repo for size
+*.parquet
+*.csv
+
+# Environments
+.venv/
+venv/
+
+# OS cruft
+.DS_Store

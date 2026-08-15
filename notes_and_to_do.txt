@@ -1,0 +1,35 @@
+
+- Answer "what is this field actually doing" for a specific column — e.g. river_id vs native_id vs exchange_trade_id as join keys, or what market_type being null on 45,444 of 58,275 book rows implies.
+- Run a distribution/missingness check on a column you're curious about and hand back the numbers, no interpretation attached.
+- Chase your latency to-do (which markets carry the 10–30s tail) — that's an EDA question about the timestamp columns, so it sits inside your current step rather than after it.
+
+
+# The latency isn't horrible even the tail end of the distribution, but 10-30 seconds is concerning
+# To do: in which markets does this happen in?
+
+
+
+##### From Claude ############
+
+Back to the analysis — I've built the Q1 efficiency table. Time-weighted per market, so idle markets don't get over-counted by event-driven rows:
+
+┌────────────────┬──────┬──────────┬─────────────┬─────────┬────────┬─────────┬────────────────────┐
+│     series     │ mkts │   tw     │   tw top    │ upd/min │ trades │ volume  │ cost to cross vs   │
+│                │      │  spread  │    depth    │         │        │         │        mid         │
+├────────────────┼──────┼──────────┼─────────────┼─────────┼────────┼─────────┼────────────────────┤
+│ KXMLBTOTAL     │ 11   │ 0.0106   │ 29,921      │ 9.50    │ 690    │ 150,770 │ 0.0169             │
+├────────────────┼──────┼──────────┼─────────────┼─────────┼────────┼─────────┼────────────────────┤
+│ KXMLBRFI       │ 1    │ 0.0100   │ 428,524     │ 5.69    │ 1,234  │ 272,584 │ 0.0219             │
+├────────────────┼──────┼──────────┼─────────────┼─────────┼────────┼─────────┼────────────────────┤
+│ KXMLBF5TOTAL   │ 7    │ 0.0139   │ 4,889       │ 2.30    │ 160    │ 42,800  │ 0.0196             │
+├────────────────┼──────┼──────────┼─────────────┼─────────┼────────┼─────────┼────────────────────┤
+│ KXMLBTEAMTOTAL │ 14   │ 0.0157   │ 3,111       │ 2.54    │ 148    │ 15,951  │ 0.0205             │
+└────────────────┴──────┴──────────┴─────────────┴─────────┴────────┴─────────┴────────────────────┘
+
+The shape of it: KXMLBRFI and the KXMLBTOTAL strikes near the money are the efficient ones. RFI sits at a 1¢ spread 97% of the time with ~428k contracts at top of book and carries the most trades; KXMLBTOTAL is 1¢ 96% of the time and updates ~9.5×/min, roughly 4× the team-total markets. TEAMTOTAL is the least efficient — widest spread (only 61% of the time at 1¢), thinnest book, and 14 markets splitting an already thin 15,950 contracts of flow. Efficiency tracks attention and payoff simplicity: one binary everyone can price (RFI) and the headline game total attract the flow; per-team strikes fragment it.
+
+Two things worth noting before I write this up:
+- Cost to cross is flattest in relative terms near p=0.5 and blows up in the wings — the deep-OTM strikes (-2 at 1.5 runs, tw_mid 0.97) look cheap in absolute cents but cost 33% of their variance scale to trade. I'll report both.
+- RFI's 428k top-of-book depth is a huge outlier and almost certainly the thread to pull for Q3's "most informed action."
+
+Next I'll add the no-arbitrage check across the KXMLBTOTAL strike ladder (monotonicity in line, and team totals vs. game total) to back the efficiency ranking with something harder than spread width, then write Q1 into the notebook. Want me to keep going through Q2–Q4 in one pass, or check in after each question?

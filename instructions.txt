@@ -1,0 +1,20 @@
+The attached files contain both orderbook delta and trade data on an MLB Game.
+
+Questions / Tasks
+1. Which of the markets are likely to be the most efficient and why?
+
+2. At what time-interval would you be least certain about how many runs there will be in the game? (Choose a 1-minute time interval--there can be many answers here).
+
+3. What is the most informed action / series of actions in the dataset? (i.e. somebody traded 5k contracts, somebody added 10k contracts to the top of the orderbook). For the person that made such an action, what was an “economic cost or risk” that they exposed themselves to while making this action, or how might this action have ended poorly (beyond simply losing more money if they lost the trade)?
+
+4a. How would you design a signal that would detect similar informed actions in real-time?
+4b. If you had no historical data, how would you roll out this signal to maximize your total expected profit in a three-month window, assuming you have a max loss tolerance of $1,000 and you estimate the signal has a 55% win probability on each trade (10% edge over a 50% breakeven) and there are 500 uncorrelated trades per day? Would you paper-trade or use your budget up?  
+
+Assumptions / Definitions:
+Making has 0 fees, taking has a fee of p*(1-p)*0.07, therefore, if the bid/ask is 0.49/0.50, taking costs 0.50*0.50*0.07 + 0.50 = 0.5175
+
+Ticker Definitions
+KXMLBRFI = Will there be at least 1 run in the 1st inning of a baseball game (both teams combined total)
+KXMLBF5TOTAL - # of runs in the first 5 innings of the game (both teams combined total)
+KXMLBTEAMTOTAL - # of runs a given team will score in the game
+KXMLBTOTAL - # of runs scored in the game (both teams combined total)
