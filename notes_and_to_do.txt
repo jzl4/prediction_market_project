@@ -1,3 +1,36 @@
+# Unique columns of df_books
+best_bid                0
+best_ask                0
+bids                    0
+asks                    0
+collector_run_id        0
+spread                  0
+
+# Unique columns of df_trades
+price                    0
+qty                      0
+aggressor_buy_flag       0
+exchange_trade_id        0
+date                     0
+hour                     0
+
+# Common columns of both:
+recv_ts_utc             0
+exchange_ts_utc         0
+msg_type                0
+river_id                 0
+native_id                0
+stat                    0
+market_type         45444
+line                     0
+game_pk                  0
+player_id             2232
+player_name           2232
+outcome_name             0
+latency_s                0
+
+# To do: which of these columns in common is the ones that I should use to join them?  Looking for something that indicates the same product/market
+
 
 - Answer "what is this field actually doing" for a specific column — e.g. river_id vs native_id vs exchange_trade_id as join keys, or what market_type being null on 45,444 of 58,275 book rows implies.
 - Run a distribution/missingness check on a column you're curious about and hand back the numbers, no interpretation attached.
@@ -10,6 +43,8 @@
 
 
 ##### From Claude ############
+
+(Claude did some analysis for Q1)
 
 Back to the analysis — I've built the Q1 efficiency table. Time-weighted per market, so idle markets don't get over-counted by event-driven rows:
 
@@ -33,3 +68,81 @@ Two things worth noting before I write this up:
 - RFI's 428k top-of-book depth is a huge outlier and almost certainly the thread to pull for Q3's "most informed action."
 
 Next I'll add the no-arbitrage check across the KXMLBTOTAL strike ladder (monotonicity in line, and team totals vs. game total) to back the efficiency ranking with something harder than spread width, then write Q1 into the notebook. Want me to keep going through Q2–Q4 in one pass, or check in after each question?
+
+
+
+
+####### From Claude ############
+
+Me: What do you think the 2 types of msg_type "update" and "snapshot" represent in df_books?  Justify your answer with examples
+
+Snapshots arrive in bursts of 33 — and there are exactly 33 markets in the file (11 TOTAL + 14 TEAMTOTAL + 7 F5 + 1 RFI). That's the tell. Let me confirm the mechanism.
+
+Short answer: update = an incremental book event as it happened; snapshot = a full-book resync that restates current state, whether or not anything changed. Four pieces of evidence.
+
+1. Snapshots arrive in synchronized bursts of exactly 33 — the number of markets in the file.
+
+2026-08-05 17:35:38    33     <- session start, every market at once
+2026-08-05 17:42:58     1
+2026-08-05 17:42:59    15
+2026-08-05 17:51:04    33
+2026-08-05 17:57:44    33
+2026-08-05 18:04:42    33
+
+218 distinct burst times, most of them all-33. Real market activity never hits 33 unrelated strikes in the same second. This is the collector (re)subscribing and the exchange replying with the full book for every subscription. The split bursts (17:42:58 + 17:42:59) are just one burst straddling a second boundary.
+
+2. A worked example — KXMLBTEAMTOTAL-...-PIT7, a quiet market:
+
+recv          exchange      type       apparent lat   book
+17:35:38.77   17:33:53.62   snapshot       105.15s    0.14/0.16  338/3225
+17:36:03.67   17:36:03.65   update           0.02s    0.14/0.16  288/3225
+17:41:00.86   17:41:00.83   update           0.02s    0.14/0.16  288/3225
+17:45:57.83   17:45:57.81   update           0.02s    0.14/0.16  288/3225
+17:49:01.98   17:49:01.32   update           0.66s    0.14/0.16  288/3225
+17:51:04.52   17:49:01.32   snapshot       123.20s    0.14/0.16  288/3225
+17:57:44.77   17:49:01.32   snapshot       523.45s    0.14/0.16  288/3225
+
+Look at the last two rows. Both snapshots carry exchange_ts = 17:49:01.32 — the timestamp of the last time the book actually changed. Nothing happened in this market for eight minutes, so each resync keeps restating that stale timestamp. Updates, by contrast, are stamped when the event occurred and land ~20ms later.
+
+3. The content check confirms it. Splitting rows by whether exchange_ts repeats the previous message in that market:
+
+┌──────────┬──────────────────────────┬────────┬────────────────────────┐
+│ msg_type │ repeats prev exchange_ts │   n    │ book identical to prev │
+├──────────┼──────────────────────────┼────────┼────────────────────────┤
+│ snapshot │ yes                      │ 2,198  │ 100%                   │
+├──────────┼──────────────────────────┼────────┼────────────────────────┤
+│ snapshot │ no                       │ 2,558  │ 9%                     │
+├──────────┼──────────────────────────┼────────┼────────────────────────┤
+│ update   │ yes                      │ 3,846  │ 13%                    │
+├──────────┼──────────────────────────┼────────┼────────────────────────┤
+│ update   │ no                       │ 49,111 │ 11%                    │
+└──────────┴──────────────────────────┴────────┴────────────────────────┘
+
+Every single snapshot that restates an old exchange_ts is byte-identical to the previous book — zero information content. That's the defining behavior of a resync. Overall 51% of snapshot rows carry no book change at all, versus 11% of updates.
+
+The update-with-repeated-timestamp rows are a different animal: 87% of those did change the book. Those are multiple deltas sharing one millisecond stamp — the exchange batching several price-level changes at the same instant, delivered as separate messages.
+
+4. Practical consequence: dedupe on snapshots, and never use them for timing. For any event-time analysis, update rows are your real feed. Snapshots are for state recovery — useful to confirm your reconstructed book hasn't drifted, useless as observations of market activity. Counting them as events would inflate update rates in quiet markets, exactly where you can least afford it.
+
+This partly rewrites your latency note. Dropping snapshots and repeated-timestamp rows:
+
+raw   (all 58,275 rows):  median 0.023s   p90 37.1s   p99 172.4s   max 1943.7s
+clean (49,111 updates):   median 0.022s   p90 34.2s   p99  42.8s   max  385.6s
+
+The scary tail was mostly an artifact — max 1943s was a snapshot restating a book that hadn't moved in 32 minutes, not a half-hour collector stall. Same for the 24-minute gap you saw between the books' earliest exchange_ts (17:11:13) and earliest recv_ts (17:35:34): that's the opening snapshot burst reporting a book last touched at 17:11.
+
+But it does not fully explain your bimodality. Genuine updates still show median 22ms against a p90 of 34s — a real second mode. And to your to-do question, "which markets": all of them, essentially identically.
+
+┌────────────────┬────────┬───────┬───────┬───────┐
+│     series     │   n    │  p50  │  p90  │  p99  │
+├────────────────┼────────┼───────┼───────┼───────┤
+│ KXMLBF5TOTAL   │ 4,662  │ 0.022 │ 34.96 │ 41.68 │
+├────────────────┼────────┼───────┼───────┼───────┤
+│ KXMLBRFI       │ 1,852  │ 0.021 │ 35.03 │ 41.29 │
+├────────────────┼────────┼───────┼───────┼───────┤
+│ KXMLBTEAMTOTAL │ 10,556 │ 0.022 │ 34.63 │ 41.06 │
+├────────────────┼────────┼───────┼───────┼───────┤
+│ KXMLBTOTAL     │ 32,041 │ 0.022 │ 34.00 │ 43.35 │
+└────────────────┴────────┴───────┴───────┴───────┘
+
+That uniformity is the finding. If the delay were about market liquidity or feed priority you'd expect RFI and TOTAL to differ from the thin team totals — they don't, to two decimal places. It points at something collector-side and periodic that stalls all subscriptions together, not at anything about the markets themselves.
