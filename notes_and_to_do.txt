@@ -1,3 +1,377 @@
+# Background about the data & sports betting markets
+- The vendor is River Markets, which is a prime broker / unified execution layer for prediction markets - one API across venues, live on Kalshi, Polymarket, Polymarket.  They raised $8.5 million seed announced on Aug 11th, 2026
+- The ID native_id, such as KXMLBTOTAL-26AUG051940PITMIL-9, is one specific bet, such as "Will the Fed hike in September" or "Will the Giants win the Superbowl?".  One question, one order book, one price.  Prices are between 0 and 1, and correspond to an implied probability of the event happening. For instance, a price of 0.47 means the market believes there is a 47% chance that Fed will hike in Sept. If someone buys at 0.47, and the Fed does hike, he receives $1 and makes a profit of $0.43
+- Distinction between native_id vs. river_id: river_id is River's venue-neutral number for the same thing, so their customers can manage one set of identifiers, instead of dealing with both Kalshi's identifiers and Polymarket's condition-ID identifiers. The reason why they're 1-to-1 here is because this file quotes markets/bets from only one venue.  If instead, the bet/prediction traded on both Kalshi and Polymarket, we'd get 2 different river_ids.  For the purposes of this exercise, just treat native_id and river_id as the same
+
+# Baseball
+- The prediction markets in this dataset relate to baseball, specifically concerning the number of runs (a player crossing home plate)
+- Example: P(runs >= 8) = 0.445 means 44.5% chance of there being 8 or more runs in this game
+- Therefore, the strike k where the probability crosses 0.5 (50% chance) is where the market expects the median number of runs to happen in a game. It's around k = 7 to 8 runs, because P(runs >= 7) and P(runs >= 8) are the closest values to 50%. Specifically, this happens at strike 7 with probability 0.565 and strike 8 with probability 0.445.  But this is the median, not the average/mean.  The mean is higher because the run distribution is necessarily bounded at zero on the left side and unbounded on the right side (number of runs must be 0 or greater, but there is no upper limit), so mean > median due to right-skew
+- The reason why the strikes are at half integer increments like 1.5, is because the event can never expire on that strike.  It must expire at 1, 2, 3, etc, so it is unambiguous whether or not the contract pays out or not.  For instance, contract KXMLBTOTAL-9 means 9 or more runs, which is identical to "over 8.5".  In other words, strike of 1.5 means P(number or runs is 2 or more).  So P(number of runs = exactly 2) = P(runs >= 2) - P(runs >= 3)
+- team_totals is one team on its own; totals is both teams combined. The data:
+
+line                       1.5    2.5    3.5    4.5    5.5    6.5    7.5
+Milwaukee Brewers;Over    0.805  0.650  0.495  0.355  0.235  0.155  0.095
+Pittsburgh Pirates;Over   0.770  0.605  0.450  0.315  0.210  0.135  0.085
+
+game TOTAL at line 3.5  = 0.845
+
+At the same 3.5 strike, each individual team is near 0.45-0.50 but the combined game total is 0.845 — because getting 4+ runs is far easier for two teams together than for either alone. Each team's median is ~3.5 runs; the two sum to ~7, which lines up with the game total's median of 7-8. That's your additivity constraint holding.
+
+That's also why there are 14 team-total markets: 2 teams × 7 strikes. And it's visible in outcome_name, which reads "Milwaukee Brewers;Over" vs "Pittsburgh Pirates;Over" — the team is named because the contract is about that team alone. Incidentally, Milwaukee prices above Pittsburgh at every strike, so the market expects Milwaukee to score more.
+
+Every contract in this file is cumulative — P(runs ≥ n). That's a survival function, and it is monotonically decreasing by definition. That's your call-spread argument and it always holds:
+
+P(>= 2) = 0.965
+P(>= 3) = 0.935
+P(>= 4) = 0.845   ... strictly decreasing all the way down to
+
+P(>=12) = 0.145
+
+Note: This is actually 1 - CDF from statistics, because in statistics, we quote P(X < some constant k), which is the other way around.  In sports betting on Kalshi, this is the survival function, which is the complement of CDF.  Survival function must be monotonically decreasing, just like how the CDF is monotonically increasing towards 1.0
+
+But P(exactly n) is what you get by differencing adjacent strikes, and that is emphatically not monotone — it's a hump:
+
+P(exactly  1) = 0.035  ####
+P(exactly  2) = 0.030  ###
+P(exactly  3) = 0.090  ##########
+P(exactly  5) = 0.120  ##############
+P(exactly  7) = 0.120  ##############
+P(exactly  9) = 0.100  ###########
+P(exactly 11) = 0.070  ########
+
+P(exactly 7 runs) is nearly four times P(exactly 1 run). Runs are roughly Poisson-distributed with a mean near 8, so the density peaks in the middle and falls off both sides.
+
+Note: This is basically the PMF (probability mass function from university statistics), and it is the derivative of the survival or CDF function
+
+
+##################
+
+Your lower bound is right: P(total ≥ n) ≥ max(P(MIL ≥ n), P(PIT ≥ n)). That holds because runs are non-negative — if Milwaukee alone scores 4, the game total is automatically ≥ 4.
+
+For the upper bound, though it is actually a random variable Z = X + Y (sum of runs from individual teams), which is a convolution
+
+Me: totals vs team_totals is X + Y = Z, so it's a convolution. In baseball, what is the
+shape of the distributions for X and Y closest to? If X ~ Poisson(l1) and Y ~ Poisson(l2)
+then Z ~ Poisson(l1+l2). If binomial with same p, Z ~ Binomial(n1+n2, p). But this assumes
+independence, and team scores may be correlated. I'd like to use independence as a
+first-order approximation via convolution.
+
+The convolution logic is exactly right, including both closure results (Poisson closure
+holds generally; the binomial one requires the SAME p, which is why n1+n2 works - it's just
+pooling Bernoulli trials).
+
+The answer to "what shape" is: NOT Poisson, and not binomial - NEGATIVE BINOMIAL.
+And our own ladders prove it.
+
+The three classic discrete distributions are distinguished by variance-to-mean ratio:
+
+    Binomial             var/mean < 1     underdispersed
+    Poisson              var/mean = 1     the reference case
+    Negative binomial    var/mean > 1     overdispersed
+
+Fitting each market-implied ladder by least squares on the survival points:
+
+    MIL (team)   Poisson: lam=3.75              RMSE=0.0599
+                 NegBin : mean=3.89  var=7.29   var/mean=1.87   RMSE=0.0048  (12x better)
+
+    PIT (team)   Poisson: lam=3.48              RMSE=0.0643
+                 NegBin : mean=3.63  var=7.18   var/mean=1.98   RMSE=0.0033  (19x better)
+
+    GAME TOTAL   Poisson: lam=7.29              RMSE=0.0666
+                 NegBin : mean=7.52  var=15.89  var/mean=2.11   RMSE=0.0092  (7x better)
+
+    FIRST 5      Poisson: lam=3.80              RMSE=0.0668
+                 NegBin : mean=4.04  var=8.62   var/mean=2.13   RMSE=0.0078  (9x better)
+
+Every ladder lands at var/mean ~ 1.9-2.1. Baseball runs have roughly TWICE the variance a
+Poisson would allow. The negative binomial fits to RMSE 0.003-0.009 - under one cent, which
+is inside the bid-ask spread, so it's fitting as well as the data can resolve.
+
+This matches the sabermetrics literature: runs per team per game are a standard example of
+overdispersion, and the negative binomial (Tom Tango's "Enby" distribution is a refinement)
+is the accepted workhorse. Steven Miller's Weibull model is the other well-known choice,
+used to derive the Pythagorean win expectation.
+
+WHY BASEBALL BREAKS POISSON: a Poisson process needs independent increments - each scoring
+opportunity independent of the last. Baseball violates this structurally. Runs don't arrive
+one at a time at a constant rate; they arrive in INNINGS, IN BURSTS. A rally puts runners on
+base, which raises the probability of the next run, and a home run with two men on scores
+three at once. Three outs then shut the inning down entirely. So you get many innings with
+zero and occasional innings with four - clustering, which is exactly overdispersion. The
+standard formalization is a Poisson-gamma mixture (lambda itself random, varying by matchup,
+weather, bullpen), and that mixture IS the negative binomial.
+
+--------------------------------------------------------------------------------
+THE CONVOLUTION TEST - THIS IS THE PAYOFF
+--------------------------------------------------------------------------------
+
+Fit each team separately, convolve, compare to the market's independently-quoted game total:
+
+           market S(n)   Poisson conv     NegBin conv
+    n= 4        0.845      0.930 (+.085)   0.867 (+.022)
+    n= 7        0.565      0.584 (+.019)   0.560 (-.005)
+    n= 9        0.365      0.302 (-.063)   0.354 (-.011)
+    n=12        0.145      0.065 (-.080)   0.146 (+.001)
+
+    mean |error|             0.0601          0.0104
+    implied E[Z]             7.23            7.52
+
+The negative binomial convolution reproduces the ENTIRE game-total ladder to about ONE CENT
+- inside the spread, so it's consistent with the market to the limit of measurement. Poisson
+is six times worse and wrong SYSTEMATICALLY: too fat in the middle, far too thin in the tail.
+At n=12 it says 0.065 where the market says 0.145 - less than half. That tail error is
+precisely the overdispersion being thrown away.
+
+TWO CONSTRAINTS COME OUT CLEAN:
+
+(a) MEANS ADD EXACTLY.  MIL 3.89 + PIT 3.63 = 7.52, and the game total fitted independently
+    gives 7.52. Additivity holding to two decimals across separately-quoted markets.
+
+(b) WE CAN BACK OUT THE CORRELATION.  Since Var(X+Y) = Var(X) + Var(Y) + 2*Cov(X,Y):
+
+        7.29 + 7.18 = 14.47   (what independence would give)
+                      15.89   (what the game-total ladder implies)
+
+    The gap implies Cov ~ 0.71, so RHO ~ +0.10. The market is pricing a small POSITIVE
+    correlation between the two teams' scores - which makes baseball sense: both teams share
+    the ballpark, the weather and wind, the umpire's strike zone, and the general run
+    environment of the night. Slugfests and pitchers' duels both tend to be mutual.
+
+    So independence isn't exact, but now we have a number for how wrong it is: small enough
+    that the first-order convolution is a genuinely good approximation, which is why the
+    NegBin convolution came within a cent.
+
+CAVEATS BEFORE LEANING ON THIS: the team ladders only go to strike 8 while the game total
+runs to 12, so the team tail variances are EXTRAPOLATED rather than observed - the rho ~ 0.10
+estimate is the softest number here. And all of it is fitted to MID prices, which carry half
+a spread of noise. Fitting to bid and ask separately would give a band rather than a point
+estimate.
+
+(Note: scipy was not installed in this environment - had to pip install scipy to run the
+nbinom fits. pyarrow was also missing earlier and had to be reinstalled.)
+
+
+#############################
+
+Me: Confirming what the 4 tickers mean. 
+
+KXMLBTOTAL = runs in the game, sum of team A and B, this is Z = X + Y. 
+
+KXMLBF5TOTAL = runs in the first 5 innings, again both teams, but must be
+strictly less than KXMLBTOTAL since it's only 5 of 9 innings. 
+
+KXMLBTEAMTOTAL = team_totals, X or Y separately, which is why 7 strikes x 2 teams = 14 contracts. 
+
+KXMLBRFI = runs from both teams Z = X + Y but only in the 1st inning. So KXMLBRFI <= KXMLBF5TOTAL for all strikes?
+
+Claude:
+All four are right. Two refinements, both small but they matter for coding the checks.
+
+    KXMLBTOTAL      Z = X + Y over the whole game                        OK
+    KXMLBTEAMTOTAL  X and Y separately, 7 strikes x 2 teams = 14         OK
+    KXMLBF5TOTAL    X + Y restricted to innings 1-5                      OK
+    KXMLBRFI        X + Y restricted to inning 1. Name is literally
+                    "Run First Inning"                                   OK
+
+REFINEMENT 1: it's <=, NOT strictly <.
+F5 runs EQUAL total runs whenever nobody scores in innings 6-9, which is a perfectly
+ordinary game. So as random variables:
+
+        RFI  <=  F5  <=  TOTAL
+
+and that holds PATHWISE - on every single realization, not just on average. That's the
+strong form. Inning 1 is contained in innings 1-5, which is contained in innings 1-9. We're
+not comparing two distributions that happen to be ordered; we're comparing nested sums of
+the same non-negative quantities.
+
+Pathwise containment is what GIVES us the survival-function inequality (this is first-order
+stochastic dominance):
+
+        S_RFI(n)  <=  S_F5(n)  <=  S_TOTAL(n)     for every n
+
+REFINEMENT 2: "for all strikes" is only ONE strike for RFI.
+RFI is a single binary contract at line 0.5 - there's no ladder, because "at least 1 run" is
+the only question it asks. So the RFI-vs-F5 comparison is testable at exactly one point, n=1.
+
+Empirical nesting check (mids at end of pregame window):
+
+      n      RFI       F5      TOT   verdict
+      1    0.395    0.920        -   OK
+      2        -    0.805    0.965   OK
+      3        -    0.665    0.935   OK
+      4        -    0.495    0.845   OK
+      5        -    0.365    0.765   OK
+      6        -    0.255    0.645   OK
+      7        -    0.185    0.565   OK
+      8        -        -    0.445   (single market)
+      9        -        -    0.365   (single market)
+     10        -        -    0.265   (single market)
+     11        -        -    0.215   (single market)
+     12        -        -    0.145   (single market)
+
+The nesting holds everywhere it can be tested. NOTE: the game total has no 0.5 strike (it
+starts at 1.5), so RFI and TOTAL never share a strike - we can only chain them transitively
+through F5.
+
+--------------------------------------------------------------------------------
+SANITY CHECK THAT FALLS OUT OF THIS (using the fitted NegBin means)
+--------------------------------------------------------------------------------
+
+    E[F5] = 4.04  of  E[TOTAL] = 7.52   ->  F5 accounts for 53.7% of expected runs
+    innings 1-5 out of 9                ->  naive proportional share = 55.6%
+
+Close, and the small shortfall has real causes pulling in that direction: extra innings add
+runs beyond the ninth, and late innings tend to score more per inning as starters tire and
+bullpens come in. So the market prices F5 slightly BELOW its per-inning share, which is what
+we'd expect.
+
+*** ONE NUMBER WORTH A SECOND LOOK ***
+
+If runs were spread evenly, the first inning would average 7.52/9 = 0.84 runs. The market
+says P(>=1 run in the 1st) = 0.395, which implies that WHEN the first inning scores, it
+averages 0.84/0.395 ~ 2.1 runs. That's on the high side. Either it reflects a genuine read on
+this matchup - two strong starting pitchers making a scoreless first likely, with scoring
+concentrated when it does break through - or it's a pricing quirk.
+
+Flagging rather than concluding: no league baseline in hand to compare against. TO DO: look
+up the MLB league-average P(at least 1 run in the 1st inning) and compare.
+
+But remember RFI is the market with the anomalous 428k top-of-book depth and the most trades
+in the whole dataset. If we go looking for the "most informed action" in Q3, a first-inning
+market that is both the most heavily traded AND possibly priced away from a naive baseline is
+a natural place to start.
+
+
+###################################
+
+
+So the constraint set for the no-arb check is:
+
+1. Within a chain — S(n) monotonically decreasing, and every differenced bucket ≥ 0 (call spreads non-negative, butterflies non-negative).
+2. Across nested chains — RFI ⊆ F5 ⊆ game total, so at any shared strike, S_RFI(n) ≤ S_F5(n) ≤ S_total(n).
+3. Teams to total — the convolution of the two team distributions should reproduce the game-total distribution; the weak but always-valid version is S_total(n) ≥ max(S_MIL(n), S_PIT(n)).
+4. Means add exactly — E[MIL] + E[PIT] = E[total].
+
+Constraint 3 is the one most likely to be violated in practice, since team totals were your least liquid, widest-spread markets. That connects straight back to Q1: if the thin markets are the ones breaking consistency with the liquid ones, that's much stronger evidence about efficiency than spread width alone.
+
+
+
+
+
+
+
+
+####### From Claude ############
+
+Me: Search online to see if these fields match any prediction market API (Polymarket,
+Kalshi, ProphetX, etc). There might be public info explaining river_id, native_id, etc.
+
+Yes - nearly every column is publicly documented. The vendor is River Markets
+(docs.rivermarkets.com), and the venue underneath is Kalshi.
+
+River is a prime broker / unified execution layer for prediction markets - one API across
+venues, live on Kalshi, Polymarket, and Polymarket US. They raised an $8.5M seed announced
+August 11, 2026, four days ago. Their whole product premise is exactly the two-column
+pattern I'm looking at:
+
+    "River IDs are numeric identifiers assigned to every market listing on River Markets'
+    platform. Native IDs are the exchange-specific identifiers each marketplace uses
+    independently."
+    "River IDs abstract this away, allowing you to use one numeric identifier format no
+    matter which exchange a market trades on."
+
+So river_id <-> native_id is a venue-agnostic key mapped to a venue-native ticker. They're
+1:1 in this file only because there's a single venue here; on a market listed on both
+Kalshi and Polymarket you'd get two river_ids, grouped by a separate "generic asset ID".
+
+Columns confirmed verbatim in River's docs:
+
+  your column          River's docs            documented meaning
+  -------------------- ----------------------- ---------------------------------------------
+  river_id             concepts/river-ids      "standardized numeric identifier for every
+                                               contract on every venue" (e.g. 4552150)
+  native_id            concepts/river-ids      exchange-native id; Kalshi -> ticker
+  msg_type             ws-api-ref/orderbooks   the `type` field: snapshot | update |
+                                               pending | error | reconnect
+  best_bid / best_ask  ws-api-ref/orderbooks   best_bid_price / best_ask_price, null if
+                                               that side is empty
+  bids / asks          ws-api-ref/orderbooks   arrays of {price, qty}
+  price                ws-api-ref/tradeprints  "Trade price, normalised to 0-1 in YES terms"
+  qty                  ws-api-ref/tradeprints  "Trade size in contracts"
+  aggressor_buy_flag   ws-api-ref/tradeprints  boolean|null - taker direction, true=buy,
+                                               false=sell, null if unknown
+  exchange_trade_id    ws-api-ref/tradeprints  "Exchange-assigned trade id" - explicitly
+                                               FOR DEDUPLICATION
+  exchange_ts_utc      ws-api-ref/tradeprints  exchange_timestamp, ISO-8601,
+                                               "Exchange-reported trade time"
+  game_pk              MLB Stats API           MLBAM's unique primary key per game - not a
+                                               market field at all
+
+The msg_type question is settled by the docs, and it matches what we derived:
+
+    "snapshot: Delivered once upon successful subscription when the orderbook is already
+     cached"
+    "update: Sent for all subsequent changes with identical payload structure"
+
+Note "identical payload structure" - that's why snapshot and update rows look the same in
+the dataframe.
+
+native_id format is confirmable on Kalshi's live site:
+kalshi.com/markets/kxmlbrfi/pro-baseball-run-in-first-inning/KXMLBRFI-26MAR291340COLMIA
+- same {ticker}-{YYMMMDD}{HHMM}{TEAMS} shape as our KXMLBRFI-26AUG051940PITMIL.
+
+Two smaller things fall out. Kalshi's own spec defines trade size as count_fp, "fixed-point
+contracts, 2 decimals" - and our qty is exactly 2dp on 100% of rows while only 42% are
+integers. That's why we see 27914.900000000005: fractional contracts, plus float
+representation error. And Kalshi's book is natively yes-bids/no-bids ("the API only returns
+bids, not asks, because of the reciprocal relationship between YES and NO"), so River is
+the layer converting that into the conventional bid/ask book on the Over outcome we have.
+
+Columns that are NOT River's - stat, line, market_type, outcome_name, player_id,
+player_name, game_pk, recv_ts_utc, collector_run_id, date, hour, spread, latency_s. None
+appear in River's market or tradeprint schemas. These are whoever-built-this-dataset's
+additions: a sports-normalization layer (stat/line/outcome_name/player_* is the standard
+odds-aggregator shape - OpticOdds uses market/selection/points/player_id for the same job)
+joined onto River's feed, plus collector bookkeeping. That's consistent with player_id /
+player_name being 100% null here: schema built for player props, no props in this file.
+
+--------------------------------------------------------------------------------
+
+ONE FINDING WORTH ACTING ON.
+
+River documents a snapshot as sent "once upon successful subscription" - once. We have 218
+snapshot bursts over six hours. Combined with the documented `reconnect` type ("issued
+during graceful pod shutdown"), that reads as the collector's websocket dropping and
+resubscribing ~218 times.
+
+That's a much better candidate for the unexplained ~35s latency mode than anything about
+the markets - which fits why it was identical across all four stat groups. The test: check
+whether the delayed updates cluster in the seconds FOLLOWING a snapshot burst. If they do,
+it's reconnect backlog, and it's a collector artifact we can filter rather than a market
+property.
+
+Also worth knowing: River publishes an is_valid flag our file doesn't have - "false
+indicates a transient crossed-book state." Checked: zero crossed and zero locked books in
+our data, so either the collector filtered invalid rows or none occurred. Not a problem,
+but it means we can't distinguish those cases ourselves.
+
+Sources:
+  https://docs.rivermarkets.com/concepts/river-ids
+  https://docs.rivermarkets.com/ws-api-reference/orderbooks
+  https://docs.rivermarkets.com/ws-api-reference/tradeprints
+  https://www.rivermarkets.com/
+  https://fortune.com/2026/08/11/exclusive-river-markets-seed-round-prediction-market-trading-tools-institutions/
+  https://docs.kalshi.com/asyncapi.yaml
+  https://kalshi.com/markets/kxmlbrfi/pro-baseball-run-in-first-inning/kxmlbrfi-26mar291340colmia
+  https://github.com/toddrob99/MLB-StatsAPI/wiki/Function:-schedule
+  https://developer.opticodds.com/docs/opticodds-for-prediction-market-makers
+
+################################################################################
+
+
+
+
 # Unique columns of df_books
 best_bid                0
 best_ask                0
