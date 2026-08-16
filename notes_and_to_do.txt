@@ -1,4 +1,224 @@
-################# For tomorrow (08/17):
+################# 
+
+More thoughts, based on trading intuition + some searching online:
+
+Q1:
+Market efficiency can be defined in several ways:
+- Bid/ask is the narrowest, liquidity is the highest (volume traded is high)
+- New information gets baked into the prices immediately.  In other words, a market who moves in 1 second after new information is more efficient than a market which takes 2 days to move and bake in (IPO market is much slower than HFT, for instance)
+- Market efficiency can also be relative to other related markets in terms of lack of arbitrage opportunities. If the quoted markets are all CDFs (or survival functions which evaluate the probability of number of runs being greater than a value k), then certain qualities must hold, like the marginal probabilities (number of runs being exactly equal to a value k) must be strictly positive (net of transaction costs). Other qualities must hold as well, like the number of runs in first 5 innings must be less than, or equal to, the number of runs in the whole game (9 innings).  A market can still be efficient from lack of arbitrage opportunities, but if it is close to violating these conditions, like probability of k runs in first 5 innings is almost equal to probability of k runs in 9 innings, or if P(number of runs = exactly k) (which is a diff of two CDF markets), this is almost not efficient
+
+Q2:
+Since this question is asking me about which time interval I am least certain about how many runs there will be in a game?  And it is asking me to evaluate in 1 min intervals, here is what I can do:
+(1) Define what it means to be "not certain about the runs in a game".  Many possible choices.  Examples might include: bid/ask spreads are the widest. The shape of the PMF (marginal distribution) is the widest, i.e. - probability of runs = 1 and probability of runs = 10 are higher than historically (uncertain about runs) compared to a case where probability of runs = 1 or 10 are close to zero and probability of runs = 6 or 7 is close to 100% (certain about runs).  Lack of trading volume, which indicates lack of informed participants.  Or whatever other ideas come to mind.  Create 3 or 4 or 5 evaluator criterion - criterion 1, criterion 2, etc.
+(2) Then literally just run these 3-5 criteria forwards in time, through the whole dataset's history, from beginning to end, over every 1-min increment. Then example the results.  For instance: "At 4:37 PM, we saw the widest bid/ask spread in the entire dataset's timeline.  here is the distribution of the bid/ask spread for this markek, and at 4:37 PM, we ended up in the far right tail of the distribution in terms of bid/ask wide".  Repeat for each of these criteria
+
+Q3: My first impression of someone who is an informed participant is someone who has material non-public information about the market, and thus can make a very large bet in the market, and probably annihilates multiple price levels in the price stack in a single trade.  What this looks like in a practical basis: let's say the market is something like 0.37 bid / 0.38 offer, with 100 contracts on both sides.  An informed participant who knows that the true value is actually going to be 0.25 (due to MNPI) will smash through all of the bids, all 100 contracts of 0.37, then all 200 contracts of 0.36, then all 120 contracts of 0.35, all the way down to maybe 0.27 or 0.28.  Defining feature is that the size is very large (statistically significant, much bigger than what the distribution of sizes normally implies, let's say mean of 100 sizes with stdev of 20, and this guy trades a size of 250 or 500), and the flag is aggressive (not a limit order, but a price taker), and the price that he trades at is substantially lower than the best bid, or substantially higher than best offer.  This basically is a way to answer question Q4 (how to detect such informed players in real-time)
+
+Q4: I'm less sure about what this is asking.  I could interpret it as "If you had a trading signal with a 55% win rate, how would you trade?"  But I can also interpret it as "This signal = developing a signal for identifying informed players".  Sure, I can probably identify such players when they happen, but I can't think of a way to turn this into a 55% win rate at the moment.  Let me try again tomorrow.
+
+============================================================
+CLAUDE'S FEEDBACK ON THE ABOVE (evening of 08/16)
+============================================================
+
+--- Q1 ---
+
+Strong, with one idea to DROP: "a market close to violating a no-arb condition is
+almost inefficient" doesn't hold. A tight butterfly means the market has a SHARP
+view, not a fragile one -- P(exactly 11 runs) sitting near zero is correct, not
+nearly-broken. The binary test is whether the violation exceeds p(1-p)*0.07;
+below that it isn't exploitable and isn't an inefficiency.
+
+Also: "strictly positive" should be NON-NEGATIVE. An exact zero is fine.
+
+The second bullet (speed of incorporating information) is the most valuable one,
+and the only one that actually needs this dataset. It's measurable: after a large
+trade in one strike, how many seconds until the neighbouring strikes reprice?
+That gives a per-market response latency and connects Q1 directly to Q3.
+
+--- Q2 ---
+
+Structure is right: multiple criteria, run forward over 1-min bins, report where
+each peaks with a percentile framing. That's the shape the question wants ("there
+can be many answers here").
+
+Two fixes:
+1. Don't benchmark the PMF against HISTORICAL run frequencies -- that answers "is
+   the market unusual", not "is the market uncertain". Measure dispersion of the
+   IMPLIED PMF on its own terms: entropy or variance per minute.
+2. Watch the sign on volume. Low volume can mean uncertainty OR consensus
+   (nothing worth trading). It's ambiguous -- justify the direction or drop it.
+
+Trap to remember: differencing a noisy ladder produces NEGATIVE PMF values.
+Smooth or isotonic-fit the survival curve before differencing.
+
+--- Q3 ---
+
+Good model, but it will MISS the case the prompt hands you. Your signature is
+large + aggressive + walks through levels. That's a sweep. But the question's own
+example is "somebody added 10k contracts to the top of the orderbook" -- PASSIVE,
+not aggressive. Your definition would filter it out, and that's likely the
+headline event here (there's a ~428k resting size in RFI).
+
+Also, pregame MLB, so MNPI is a stretch. "Informed" here more likely means faster
+on public news -- lineups, scratches, weather -- or just a better model. Fine,
+because the operational test doesn't care about mechanism:
+
+    DID THE ACTION PREDICT THE SUBSEQUENT PRICE MOVE?
+
+Rank candidates by MARKOUT (price change 1 / 5 / 15 min later), not by size.
+Size finds whales; size plus markout finds information.
+
+--- Q4: the two readings are 4a and 4b ---
+
+You're stuck on something the question already gave you. 4b says "assuming you
+estimate the signal has a 55% win probability". It's an ASSUMPTION, not something
+to derive. Your Q3 detector does not have to actually achieve 55%.
+
+  4a = design the detector (comes straight out of Q3's signature)
+  4b = given a stated edge, how do you size and roll out capital?
+
+--- Q4b: the Monte Carlo plan ---
+
+Simulation is the right call. Three things determine whether it tells you
+anything true.
+
+1. GET THE PER-TRADE PAYOFF RIGHT. These are binary contracts, not symmetric
+   bets. You pay p and receive 1 or 0, so a win is +(1-p) and a loss is -p. At
+   p ~ 0.50 that's roughly symmetric, which the question's framing implies, but
+   don't hardcode +/- $50 -- hardcode the contract.
+
+2. THE FEE IS THE WHOLE STORY. At p = 0.50 the taker fee is 0.5*0.5*0.07 =
+   0.0175. The edge is 5c (55% true vs 50c price). So:
+
+       take:  EV = 0.55 - 0.5175 = +0.0325 per contract
+       make:  EV = 0.55 - 0.5000 = +0.0500 per contract
+
+   Crossing the spread eats 35% OF THE EDGE. Whether the signal can rest or must
+   take is probably the biggest lever in the whole answer -- bigger than sizing.
+   Simulate both.
+
+3. DON'T FIX p AT 0.55. This is the one that matters. If you simulate assuming
+   the edge is real, the sim will tell you the edge is real. With 500 uncorrelated
+   trades/day a genuine 3.25% net edge is enormous -- daily Sharpe ~1.4, and over
+   45,000 trades the terminal outcome is nearly deterministic. You'd conclude
+   "size up, never bust", which is correct CONDITIONAL ON 55% BEING TRUE, and that
+   condition is doing all the work.
+
+   The real risk in 4b isn't variance, it's BEING WRONG ABOUT p. So sweep it: run
+   the same sim at true p = 0.55, 0.52, 0.50, 0.48 and see what the $1,000
+   tolerance implies in each. That turns paper-trade-vs-deploy into a real
+   question instead of a rhetorical one.
+
+   And it gives the sharp answer: the standard error of the win rate after N
+   trades is sqrt(p(1-p)/N), so 500 trades -- ONE SINGLE DAY -- pins p to +/-2.2%.
+   You can buy nearly all the information paper trading would give you by trading
+   one day at minimum size, while keeping the P&L. The simulation demonstrates
+   this rather than asserting it.
+
+Two smaller notes:
+- The closed form you're declining to derive is KELLY: f* = 2p - 1 = 10% of
+  bankroll at even money. The dynamic sizing you described (scale up when ahead,
+  down when behind) IS proportional Kelly betting. Worth naming in the write-up
+  even though you got there by simulation -- arriving at it empirically is a fine
+  answer.
+- The binding constraint is MAX DRAWDOWN ALONG THE PATH, not terminal P&L. Have
+  the sim track the running minimum, not just the final number.
+
+============================================================
+
+
+Discussion at the end of the day 08/16:
+
+Me: 
+
+(1) Remember there are 33 markets quoted in the books dataset, but only 31 of those saw actual trades, which means there are 2 markets which do exist, with no active trading activity as far as we know. Worth looking into why, but I suspect that perhaps those markets are quite illiquid, with want bid/ask in the books table. Specifically, look at lines 74 to 83 in my text file. We do have trades in market team total = 8, but not in team total = 6 or 7.  We could probably capture some bid/ask by making markets in strikes 6 and 7, using what we know about neighboring strikes 4, 5, and 8, using the shape of the distribution to interpolate/imply what 6 and 7 should be priced like. Start wide (low bid, high ask) and small quantity (size) and see if anyone bites. 
+
+(2) This isn't one of the questions asked, but I thought that one way we can make money in baseball outcome market-making is by looking at history data on how baseball games have played, to get an estimation of how the correlation between 2 team runs looks like - which will resolve the question of how to calculate the convolution of the sum Z = X + Y where X and Y are the individual team scores, allowing us to price a more accurate estimate for what the team total should be relative to the individual scores markets - does that make sense at all? 
+
+(3) Other trading ideas to make money: If the marginal distribution (PMF) deviates significantly from a bell-shaped curve, or if the middle diverges away from k = 7 or 8 runs per game, buy or sell it, depending on whether it is too low or too high. If the marginal distribution (PMF) deviates significantly from a bell-shaped curve, or if the middle diverges away from k = 7 or 8 runs per game, buy or sell it, depending on whether it is too low or too high. Whenever probability of run = 1 goes too low, buy it. Some of these markets might show mean-reversion, i.e. - the probability of an outcome (number of runs = k) should hover between let's say 0.1 and 0.3 for example, so we should buy it if it goes to 0.11 or 0.12, and sell it if it goes to 0.28 or 0.29
+
+
+Claude:
+
+Your PIT6/PIT7 hypothesis is testable, and the data says something different from what you guessed.
+Dwell-weighted, all 14 team-total markets:
+
+market  line  tw_mid  tw_spread  tw_topbid_qty  n_quotes  n_trades  volume
+  MIL2   1.5  0.8029     0.0132            713       909         8    1288
+  PIT2   1.5  0.7675     0.0237            634      1050         3     372
+  MIL3   2.5  0.6367     0.0104           7098       825        17     596
+  PIT3   2.5  0.6107     0.0236            452       883         6     155
+  MIL4   3.5  0.4926     0.0148           1582       910        70   11829
+  PIT4   3.5  0.4436     0.0105           2490      1089        14     524
+  MIL5   4.5  0.3550     0.0176            867       946         4     203
+  PIT5   4.5  0.3382     0.0100            411       872         3     196
+  MIL6   5.5  0.2348     0.0104            867       630        17     582
+  PIT6   5.5  0.2201     0.0202            267       558         0       0
+  MIL7   6.5  0.1600     0.0200            786       575         4     162
+  PIT7   6.5  0.1424     0.0135            399       466         0       0
+  MIL8   7.5  0.1044     0.0205           1101       674         1      18
+  PIT8   7.5  0.0895     0.0114            564       526         1      20
+
+PIT6 and PIT7 are quoted, continuously and competitively. 558 and 466 quote updates, spreads of 2.0c
+and 1.35c. PIT7's spread is TIGHTER than PIT2's (2.37c) and PIT3's (2.36c) -- both of which traded.
+There is resting depth on both.
+
+So the missing ingredient isn't liquidity supply, it's DEMAND. And the wider story: the entire PIT
+chain barely trades -- 27 trades across all seven strikes, versus 70 trades and 11,829 contracts in
+MIL4 alone. With that little flow, two tail strikes drawing zero isn't a market failure, it's small
+numbers.
+
+That guts the market-making plan, unfortunately. "Start wide and see if anyone bites" means quoting
+OUTSIDE an existing 1.35c market -- you'd sit behind the queue and never fill. To get filled you'd
+have to quote INSIDE it, which on a 14c contract means competing for well under a cent while taking
+adverse selection from whoever does show up. Making is free, so the fee math is fine; the fill rate
+is the binding constraint, and there's no flow to capture.
+
+(2) Yes, this makes sense -- with two caveats. The approach is right and it's how you'd actually do
+it. But: you already backed rho ~ +0.10 out of the market's own prices, so a historical estimate only
+pays if it DISAGREES with what's implied. That gap is the edge, not the estimate itself. And
+correlation alone doesn't pin the joint distribution -- two negative binomial marginals plus a single
+rho admit many joint laws, and the sum depends on the dependence structure, not just its second
+moment. You'd need a copula choice, and that choice is doing real work.
+
+There's a piece of baseball structure worth chasing here, though, because it's exactly the kind of
+thing historical data would reveal and a symmetric model would miss: THE HOME TEAM DOESN'T BAT IN THE
+BOTTOM OF THE 9TH WHEN IT'S ALREADY AHEAD. MIL is home. So MIL's run distribution is truncated
+precisely in the states where MIL is winning -- an asymmetric, state-dependent dependence between X
+and Y that no plain correlation parameter captures. That would be a genuinely strong thing to find in
+history.
+
+(3) Here I'd push back hard on two of the three.
+
+- "If the PMF deviates from bell-shaped, trade it" -- your own day-1 work found the opposite. Runs
+  are negative binomial, var/mean ~ 2, right-skewed. The true distribution ISN'T bell-shaped. Fading
+  non-normality would be fading reality.
+
+- "If the middle diverges from 7 or 8, trade it" -- the mean is supposed to move, on lineups,
+  weather, starting pitchers. Fading that move is fading information, which is precisely the informed
+  flow Q3 asks you to identify. You'd be taking the other side of the smartest trade in the dataset.
+
+- Mean reversion inside a range -- this is the one to drop. Prediction market prices are MARTINGALES:
+  if it's 0.11, then 0.11 IS the market's best estimate, and there's no gravitational pull back to
+  0.20. Worse, every one of these contracts settles at exactly 0 or 1. "Hovers between 0.1 and 0.3"
+  describes a sample path that is guaranteed to leave that range and never return. You'd be
+  systematically buying dips that are actually information.
+
+The sound version of your instinct is RELATIVE VALUE. Don't bet on where the distribution goes -- bet
+that its internal structure is consistent. Monotonicity across strikes, non-negative butterflies,
+RFI <= F5 <= TOTAL, teams convolving to the total. Those must hold no matter which way the game news
+breaks, so violations are direction-neutral edge, and any violation smaller than p(1-p)*0.07 isn't
+real. That's the same machinery as Q1, which means the work does double duty.
+
+
+
+
+##############################
+
+
+
+For tomorrow (08/17):
 
 To do: What else to do for the stuff at the bottom? I have 400 lines of notes and I need decide what I need (and which section to add it), and which to cut out (because I have already dealt with it earlier)
 
