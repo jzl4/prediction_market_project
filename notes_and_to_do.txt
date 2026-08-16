@@ -1,6 +1,54 @@
-For tomorrow (08/16):
+################# For tomorrow (08/17):
 
-(1) Continue investigating the data (EDA on the columns)
+To do: What else to do for the stuff at the bottom? I have 400 lines of notes and I need decide what I need (and which section to add it), and which to cut out (because I have already dealt with it earlier)
+
+To do:
+Initial thoughts for the 4 questions:
+
+1. Which of the markets are likely to be the most efficient and why?
+- Top-of-book depth from bids/ask stack, i.e. - what is the quantity of the best bid and best offer? (Should this be dollar-weighted? For instance, if the best bid is 0.05, with a quantity of 2000, and another market has a best bid of 0.95, with a quantity of 1000 - the quantity of 2000 is greater for the bid of 0.05, but the dollar size of the best bid is higher because of 0.95 x 1000 = 950 vs. 0.05 x 2000 = 100?)
+- Trade count and volume traded in each market.  (Again, should this be dollar-weighted?  For instance, a stock that trades 1000 shares at $100 different in liquidity from a stock that trades 2000 shares at $100)
+- Need to check the no-arb conditions. This is the important implication of all of the discussions about PMF (probability massive functions), survival functions / CDFs, and so forth.  Even if the arbitrage is not violated, if the value is very extreme, such that it is close to being violated (example: a PMF density for a strike is close to zero, after we difference two adjacent survival strikes, or two survival probabilities are close in value despite having different strikes, this is nearly an arbitrage). Examples: within-chain monotonicity (P(≥n) must fall as n rises), non-negative butterflies, and the nesting RFI ≤ F5 ≤ TOTAL.  This needs to be net of trading fees, which are p*(1-p)*0.07
+
+
+2. At what time-interval would you be least certain about how many runs there will be in the game? (Choose a 1-minute time interval--there can be many answers here).
+Q2 — least-certain 1-minute interval. Your day-1 distribution work pays off here directly. Bucket to 1 minute, take the time-weighted mid per strike, difference the TOTAL ladder into a PMF, compute entropy or variance per minute, take the max.
+
+The question says "there can be many answers," which tells you it's rewarding the framing. So name the ambiguity explicitly: "least certain" can mean the market implies a genuinely wide distribution over runs, or that the market is least confident in its own prices (wide spreads, thin depth, stale quotes). Those are different intervals. Answer both and say why they differ. One practical trap — the raw PMF is sawtoothed from tick noise and will go negative when you difference it; smooth or isotonic-fit the ladder first.
+
+
+3. What is the most informed action / series of actions in the dataset? (i.e. somebody traded 5k contracts, somebody added 10k contracts to the top of the orderbook). For the person that made such an action, what was an “economic cost or risk” that they exposed themselves to while making this action, or how might this action have ended poorly (beyond simply losing more money if they lost the trade)?
+
+Q3 — most informed action. The heaviest, and the most interesting. Candidates: largest single trades, largest bursts of same-signed aggressive flow (aggressor_buy_flag), and large top-of-book depth adds — you already have the lead, that 428k RFI resting size.
+
+"Informed" has an operational definition: the action predicted the subsequent price move. So compute a markout — price change 1/5/15 minutes after each candidate — and rank by favorable markout, not by size. Size alone is a whale; size plus markout is information. This is the part that needs raw timestamps.
+
+The second half is pure reasoning and probably carries as much weight as the analysis. Risks beyond "they might lose":
+- A large resting order is free optionality written to the market — it fills precisely when someone knows more, i.e. adverse selection.
+- It reveals information; others can trade ahead of the remaining size.
+- Capital is locked until settlement hours later, in a market with no cheap exit.
+- Pregame-specific: rainout/postponement, lineup scratches, a late starting-pitcher change.
+- If they crossed instead: market impact plus the taker fee.
+
+4a. How would you design a signal that would detect similar informed actions in real-time?
+4b. If you had no historical data, how would you roll out this signal to maximize your total expected profit in a three-month window, assuming you have a max loss tolerance of $1,000 and you estimate the signal has a 55% win probability on each trade (10% edge over a 50% breakeven) and there are 500 uncorrelated trades per day? Would you paper-trade or use your budget up?  
+
+Q4a — signal design. Mostly prose. Rolling signed aggressive volume, normalized by that market's typical trade size and resting depth; plus cross-market coherence — real information moves the whole chain (TOTAL 7, 8, 9 together), noise moves one strike. Validate on markout.
+
+Q4b — rollout. Nearly zero code, and there's a sharp quantitative core:
+- Standard error of the win rate over N trades is sqrt(p(1-p)/N). At 500 trades/day that's 2.2% after one day, ~1% after a week. So one day of live trading at small size resolves 55%-vs-50% about as well as any amount of paper trading — paper trading mostly buys you delay, and delay costs you 500 trades of edge per day in a 90-day window.
+- Kelly for a binary at even money is f* = 2p − 1 = 10%. The $1,000 is a ruin constraint, not a bankroll — size fractional Kelly against it and scale up as the win rate confirms.
+- Check the fee against the edge. The edge is 5¢ on a $1 contract. Taking at the money costs 1.75¢ — over a third of it. If the signal needs to cross the spread, net edge is ~3.25%, not 10%. If it can rest, fees are zero. That distinction probably dominates the entire rollout answer.
+
+
+
+
+
+
+
+
+############### For tomorrow (08/16):
+
 (2) Reread the notes from Claude yesterday
 (3) Claude said:
 Three things queued for tomorrow, in the order I'd do them:
@@ -10,42 +58,6 @@ Three things queued for tomorrow, in the order I'd do them:
 3. Q3 via RFI. The 428k top-of-book depth is the single biggest anomaly in the dataset and it sits in the most-traded market. Start there.
 
 One loose thread I'd not lose: the ~35s latency mode in genuine update rows, uniform across all four stat groups. The reconnect-backlog hypothesis is testable in about ten minutes — check whether delayed updates cluster right after snapshot bursts — and if it's confirmed you can filter it, which matters before you do any timing-sensitive work for Q3.
-
-
-
-
-# Unique columns of df_books
-best_bid                important
-best_ask                important
-bids                    json package of whole stack - might be useful later for in-depth analysis
-asks                    json package of whole stack - might be useful later for in-depth analysis
-collector_run_id        irrelevant
-spread                  important
-
-# Unique columns of df_trades
-price                    important
-qty                      important
-aggressor_buy_flag       aggressive (true) or got limited order filled (false) - might be useful later
-exchange_trade_id        unique_id per trade - might be useful later on
-date                     not useful - we already have recv and exchange timestamps
-hour                     not useful - we already have recv and exchange timestamps
-
-# Common columns of both:
-recv_ts_utc             important
-exchange_ts_utc         important
-msg_type                important only for df_books because it contains 2 values "update" and "snapshot"
-river_id                not useful - basically same as native_id
-native_id               important - ID for the market/asset that we are trading
-stat                    totals, team_totals, etc.
-market_type             not useful
-line                    important - these are the strikes such as 2.5, 3.5, etc.
-game_pk                 not useful
-player_id               not useful
-player_name             not useful
-outcome_name            important - tell you which team it is: Brewers or Pirates
-
-# To do: which of these columns in common is the ones that I should use to join them?  Looking for something that indicates the same product/market
-
 
 
 
