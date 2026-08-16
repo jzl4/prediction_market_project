@@ -1,7 +1,7 @@
 For tomorrow (08/16):
 
-(1) Reread the notes from Claude yesterday
-(2) Continue investigating the data (EDA on the columns)
+(1) Continue investigating the data (EDA on the columns)
+(2) Reread the notes from Claude yesterday
 (3) Claude said:
 Three things queued for tomorrow, in the order I'd do them:
 
@@ -10,6 +10,86 @@ Three things queued for tomorrow, in the order I'd do them:
 3. Q3 via RFI. The 428k top-of-book depth is the single biggest anomaly in the dataset and it sits in the most-traded market. Start there.
 
 One loose thread I'd not lose: the ~35s latency mode in genuine update rows, uniform across all four stat groups. The reconnect-backlog hypothesis is testable in about ten minutes — check whether delayed updates cluster right after snapshot bursts — and if it's confirmed you can filter it, which matters before you do any timing-sensitive work for Q3.
+
+
+
+
+# Unique columns of df_books
+best_bid                0
+best_ask                0
+bids                    0
+asks                    0
+collector_run_id        0
+spread                  0
+
+# Unique columns of df_trades
+price                    0
+qty                      0
+aggressor_buy_flag       0
+exchange_trade_id        0
+date                     0
+hour                     0
+
+# Common columns of both:
+recv_ts_utc             0
+exchange_ts_utc         0
+msg_type                0
+river_id                 0
+native_id                0
+stat                    0
+market_type         45444
+line                     0
+game_pk                  0
+player_id             2232
+player_name           2232
+outcome_name             0
+latency_s                0
+
+# To do: which of these columns in common is the ones that I should use to join them?  Looking for something that indicates the same product/market
+
+
+
+
+
+
+
+
+
+
+
+- Do I care about the two markets that didn't trade?  (Why didn't they trade?)  I know that there are 33 contracts quoted in the book, but 2 out of those don't appear in the trades dataset - why?  Are they particularly illiquid?
+
+- These do not trade:
+{'KXMLBTEAMTOTAL-26AUG051940PITMIL-PIT6',
+ 'KXMLBTEAMTOTAL-26AUG051940PITMIL-PIT7'}
+
+ - These have trades:
+['KXMLBTEAMTOTAL-26AUG051940PITMIL-PIT2',
+ 'KXMLBTEAMTOTAL-26AUG051940PITMIL-PIT3',
+ 'KXMLBTEAMTOTAL-26AUG051940PITMIL-PIT4',
+ 'KXMLBTEAMTOTAL-26AUG051940PITMIL-PIT5',
+ 'KXMLBTEAMTOTAL-26AUG051940PITMIL-PIT8']
+
+- I'd bet it's because they're illiquid, and I'd bet that strike 8 has very few trades
+
+
+
+
+
+- 
+
+
+
+
+
+
+- In terms of actually building a trading strategy - we need to use the received timestamp as our datetime column.  This is because we cannot actually do trades based on the exchange timestamp. We can only trade when we receive the information on our end.  If the exchange timestamp is 3:30 PM, but we only receive it at 3:31 PM, then 3:31 PM is when we knew that information and build a trading decision on that info
+
+
+
+
+
+
 
 
 
@@ -386,39 +466,6 @@ Sources:
 
 
 
-
-# Unique columns of df_books
-best_bid                0
-best_ask                0
-bids                    0
-asks                    0
-collector_run_id        0
-spread                  0
-
-# Unique columns of df_trades
-price                    0
-qty                      0
-aggressor_buy_flag       0
-exchange_trade_id        0
-date                     0
-hour                     0
-
-# Common columns of both:
-recv_ts_utc             0
-exchange_ts_utc         0
-msg_type                0
-river_id                 0
-native_id                0
-stat                    0
-market_type         45444
-line                     0
-game_pk                  0
-player_id             2232
-player_name           2232
-outcome_name             0
-latency_s                0
-
-# To do: which of these columns in common is the ones that I should use to join them?  Looking for something that indicates the same product/market
 
 
 - Answer "what is this field actually doing" for a specific column — e.g. river_id vs native_id vs exchange_trade_id as join keys, or what market_type being null on 45,444 of 58,275 book rows implies.
