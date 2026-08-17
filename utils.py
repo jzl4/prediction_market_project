@@ -287,3 +287,188 @@ def time_weighted_cost_to_cross(b):
     half_spread = b["best_ask"] - mid
     fee = b["best_ask"] * (1 - b["best_ask"]) * TAKER_FEE_RATE
     return _weighted_mean((half_spread + fee) / mid, _dwell_seconds(b))
+
+
+# ---------------------------------------------------------------------------
+# Q4b -- rolling out the signal under a $1,000 loss tolerance
+#
+# STEP 1: the naive simulation. Constant bet size, even-money trades (p = 0.50),
+# no fees. Win $X or lose $X on each trade, 55/45.
+#
+# p = 0.50 is not an arbitrary choice: the prompt's phrase "10% edge over a 50%
+# breakeven" only makes sense at that price. Expected profit per contract is
+# (w - p), so a 55% win rate is an edge of 5 cents at p = 0.50, but would be
+# MINUS 25 cents at p = 0.80. Win rate means nothing without the price.
+#
+# Later steps (real price paths, dynamic sizing, fees) are not implemented yet.
+# ---------------------------------------------------------------------------
+
+def simulate_naive_random_walk(bet_size, n_trades=32_000, win_prob=0.55,
+                               loss_limit=-1000.0, n_paths=10_000,
+                               batch_size=500, seed=0):
+    """Monte Carlo of a constant-size, even-money betting sequence.
+
+    bet_size   -- dollars won or lost per trade
+    n_trades   -- steps per path. 32,000 = 500 trades/day x 64 days. Only the
+                  total matters, not how it splits into days: with a constant
+                  size, nothing in the walk depends on the calendar.
+    loss_limit -- absolute floor on CUMULATIVE P&L, not a drawdown from peak.
+                  Those are different rules and give different answers.
+    n_paths    -- independent simulated futures.
+    batch_size -- paths simulated at once. n_paths x n_trades floats would be
+                  ~2.5 GB at the defaults, so the work is done in batches.
+
+    Ruin is recorded but does not stop the path -- the walk runs the full
+    n_trades either way. That keeps "did it ever touch the floor" separate from
+    "where did it end up", so both can be read off the same run.
+
+    Returns a dict of summary statistics, one row's worth per call.
+    """
+    rng = np.random.default_rng(seed)
+
+    ruined      = np.zeros(n_paths, dtype=bool)     # ever touched the floor?
+    first_ruin  = np.full(n_paths, -1, dtype=np.int64)   # trade number if so
+    final_pnl   = np.zeros(n_paths)
+    worst_pnl   = np.zeros(n_paths)                 # lowest point along the way
+
+    for start in range(0, n_paths, batch_size):
+        n = min(batch_size, n_paths - start)
+
+        # +bet_size with probability win_prob, -bet_size otherwise
+        wins  = rng.random((n, n_trades)) < win_prob
+        steps = np.where(wins, bet_size, -bet_size)
+        pnl   = np.cumsum(steps, axis=1)            # running P&L along each path
+
+        below = pnl <= loss_limit
+        hit   = below.any(axis=1)
+        # argmax on a boolean row gives the first True; meaningless if none, so mask it
+        first = np.where(hit, below.argmax(axis=1), -1)
+
+        sl = slice(start, start + n)
+        ruined[sl]     = hit
+        first_ruin[sl] = first
+        final_pnl[sl]  = pnl[:, -1]
+        worst_pnl[sl]  = pnl.min(axis=1)
+
+    survivors = ~ruined
+    return {
+        "bet_size":        bet_size,
+        "prob_ruin":       float(ruined.mean()),
+        # when ruin happens, how early? The prompt's real question is whether we
+        # survive the opening stretch, so the timing matters as much as the odds.
+        "median_ruin_trade": float(np.median(first_ruin[ruined])) if ruined.any() else np.nan,
+        "median_final_pnl":  float(np.median(final_pnl)),
+        "median_final_pnl_survivors": float(np.median(final_pnl[survivors])) if survivors.any() else np.nan,
+        "median_worst_pnl":  float(np.median(worst_pnl)),
+        "p05_worst_pnl":     float(np.percentile(worst_pnl, 5)),
+    }
+
+
+def ruin_probability_closed_form(bet_size, win_prob=0.55, loss_limit=-1000.0):
+    """Gambler's ruin: chance of ever touching the floor, as a check on the sim.
+
+    For a +/-X bet with win probability w > 0.5 and a floor k bets away, the
+    probability of ever reaching that floor is ((1-w)/w) ** k.
+
+    This assumes infinitely many trades, so it is a slight OVER-estimate of what
+    a 32,000-trade simulation should produce -- the sim has a finite number of
+    chances to get there. Expect the simulation to land at or just below this.
+
+    Used as a unit test, not as the answer: if the Monte Carlo does not land
+    near these numbers, the Monte Carlo has a bug.
+    """
+    k = abs(loss_limit) / bet_size          # how many losing bets to the floor
+    return float(((1 - win_prob) / win_prob) ** k)
+
+
+def simulate_pnl_paths(bet_size, n_trades=32_000, win_prob=0.55,
+                       n_paths=40, seed=0):
+    """The same walk as simulate_naive_random_walk, but keeping the whole path.
+
+    Returns an (n_paths, n_trades) array of cumulative P&L, so the wiggle can be
+    plotted rather than just summarised. Keep n_paths small -- this holds every
+    step in memory, unlike the batched summary version.
+    """
+    rng = np.random.default_rng(seed)
+    steps = np.where(rng.random((n_paths, n_trades)) < win_prob, bet_size, -bet_size)
+    return np.cumsum(steps, axis=1)
+
+
+def plot_pnl_paths(paths, loss_limit=-1000.0, zoom=1000, max_points=2000, axes=None):
+    """Draw simulated P&L paths: the whole run, and a zoom on the opening stretch.
+
+    Two panels are necessary rather than decorative. With a 10% edge over 32,000
+    trades the paths finish in the hundreds of thousands, while the floor we care
+    about is -$1,000 -- less than 1% of the y-range. On a single full-scale axis
+    the floor and the early wiggle are invisible. The right panel rescales to the
+    first `zoom` trades, which is where ruin actually happens.
+
+    Paths that ever touch the floor are drawn in red on top of the survivors, so
+    the failures are visible even when they are a small minority.
+
+    paths      -- (n_paths, n_trades) array from simulate_pnl_paths()
+    loss_limit -- the floor to draw and to classify paths against
+    zoom       -- how many trades the right-hand panel covers
+    max_points -- points drawn per line per panel. Lines are thinned to this so
+                  the figure stays light enough for an inline notebook renderer.
+                  Only affects drawing: whether a path is classed as ruined is
+                  always decided on the full, unthinned path.
+    """
+    if axes is None:
+        _, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+    n_paths, n_trades = paths.shape
+    x = np.arange(1, n_trades + 1)
+    ruined = paths.min(axis=1) <= loss_limit
+
+    SURVIVE, RUIN, RULE = "#2a78d6", "#d1442f", "#52514e"
+
+    for ax, upto, title, label_floor in (
+        (axes[0], n_trades, f"All {n_trades:,} trades", False),
+        (axes[1], min(zoom, n_trades), f"First {min(zoom, n_trades):,} trades", True),
+    ):
+        # Drawing every point would put n_paths x n_trades vertices on the canvas
+        # -- 1.28M at the defaults, which hangs an inline notebook renderer. At
+        # full scale a 32,000-point line is far narrower than a pixel per step, so
+        # thinning to ~max_points loses nothing visible. The zoomed panel is short
+        # enough that stride comes out as 1 and it is drawn at full resolution.
+        stride = max(1, upto // max_points)
+        xs = x[:upto:stride]
+
+        # survivors first, failures on top so they are never hidden underneath
+        for i in np.flatnonzero(~ruined):
+            ax.plot(xs, paths[i, :upto:stride], color=SURVIVE, lw=0.7, alpha=0.45)
+        for i in np.flatnonzero(ruined):
+            ax.plot(xs, paths[i, :upto:stride], color=RUIN, lw=0.9, alpha=0.9)
+
+        ax.axhline(0, color=RULE, lw=1)
+        ax.axhline(loss_limit, color=RUIN, lw=1.2, ls="--")
+        # Only label the floor on the zoomed panel. At full scale -$1,000 and $0
+        # are the same line to the eye, so a label there would mislead.
+        if label_floor:
+            ax.annotate(f"loss tolerance  ${loss_limit:,.0f}", xy=(0.99, loss_limit),
+                        xycoords=("axes fraction", "data"), xytext=(0, 5),
+                        textcoords="offset points", fontsize=8.5, color=RUIN,
+                        ha="right", annotation_clip=False)
+
+        ax.set_title(title, fontsize=11, loc="left")
+        ax.set_xlabel("trade number", fontsize=9, color=RULE)
+        ax.set_ylabel("cumulative P&L ($)", fontsize=9, color=RULE)
+        ax.grid(color="#e5e5e2", lw=0.8)
+        ax.set_axisbelow(True)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+
+    # The zoom panel is the whole point, so make sure the floor is inside its
+    # y-range even when every path happens to stay well above it.
+    lo, hi = axes[1].get_ylim()
+    axes[1].set_ylim(min(lo, loss_limit * 1.35), hi)
+
+    axes[0].legend(handles=[
+        plt.Line2D([], [], color=SURVIVE, lw=1.4,
+                   label=f"survived ({(~ruined).sum()}/{n_paths})"),
+        plt.Line2D([], [], color=RUIN, lw=1.4,
+                   label=f"hit the floor ({ruined.sum()}/{n_paths})"),
+    ], fontsize=8.5, frameon=False, loc="upper left")
+
+    return axes

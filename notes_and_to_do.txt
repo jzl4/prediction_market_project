@@ -1,3 +1,109 @@
+
+
+
+
+####################### Simulation of 4B #########################
+
+THE CORE FORMULA: expected profit per contract = (w - p)
+  Buy at price p. Right -> you get $1, so you made (1 - p). Wrong -> you made -p.
+  EV = w*(1-p) - (1-w)*p = w - p.  Everything cancels.
+  So a 55% win rate is NOT an edge by itself -- it is an edge relative to price:
+      buy at 0.50 with w = 0.55  ->  edge = +0.05   (this is the question's setup)
+      buy at 0.80 with w = 0.55  ->  edge = -0.25   (catastrophic)
+  "50% breakeven" in the prompt only makes sense at p = 0.50, so the question is
+  implicitly telling us to assume even-money trades in the base case.
+
+--- THE PLAN, 4 STEPS ---
+
+STEP 1 -- NAIVE SIM (constant size, p = 0.50)
+  Win $X or lose $X, 55/45, 32,000 trades (500/day x 64 days). Measure P(cumulative
+  P&L ever touches -$1,000) for several bet sizes. This is the base case the prompt
+  literally describes.
+
+STEP 2 -- REAL PRICE PATHS
+  TRAP TO AVOID: do NOT hold w fixed at 0.55 while feeding in real prices. By
+  EV = w - p that would make the edge +19c where a market traded at 0.36 and -41c
+  where it traded at 0.96. Neither is a signal; the sim would just be measuring the
+  average price of whichever market got picked, and the "answer" would be an
+  artifact of that choice.
+
+  FIX: the win rate has to move with the price. A signal does not give "55%" in the
+  abstract -- it says a contract is MISPRICED BY SOME AMOUNT. So set
+      true probability = p + 0.05      (market is 5 cents too cheap)
+      we buy at p, so the edge is 5 cents everywhere
+  At p = 0.50 this gives w = 0.55 and recovers the prompt exactly. Cap w at 1.0.
+
+  WHAT THIS ACTUALLY SHOWS (the real point of step 2): with the fix, expected profit
+  per trade is IDENTICAL across all 33 markets -- always 5 cents. So step 2 does not
+  change the average outcome at all. What it changes is RISK OF RUIN:
+      contract at 0.96: right most of the time, collect 4c; wrong -> lose 96c.
+                        rare, brutal losses.
+      contract at 0.10: bleed 10c most of the time; occasionally collect 90c.
+                        frequent small losses, lumpy recovery.
+  Same expected profit, very different odds of touching -$1,000 on the way.
+  => WITH A FIXED LOSS BUDGET, WHERE ON THE PRICE LADDER YOU TRADE MATTERS AS MUCH
+     AS THE SIZE OF YOUR EDGE. A naive random walk cannot show this. This is the
+     differentiating insight for Q4b.
+
+  SIZE IN DOLLARS AT RISK, NOT CONTRACTS. 100 contracts at 0.96 risks $96; 100 at
+  0.10 risks $10. Not comparable. Since the constraint is a $1,000 budget, make
+  dollars-at-risk the control variable: risk $X per trade -> buy X/p contracts.
+  A loss is then always exactly $X and a win is X*(1-p)/p.
+
+  CAVEAT TO STATE: the prompt says 500 UNCORRELATED trades per day. All 500 taken
+  from one game's markets would be the opposite of uncorrelated -- every contract
+  resolves off the same nine innings. Using a real price path is a device for
+  getting realistic prices, not a claim of independence. In reality the 500 would
+  be spread across many games.
+
+STEP 3 -- DYNAMIC SIZING (resize every trade, not once a day)
+  Resizing only at day boundaries is how you finish a day at -$5k after being down
+  $900 at trade 274. Size must respond at every trade.
+  WRINKLE: if sizing is proportional (always risk 10% of what is left), the budget
+  mathematically CANNOT reach zero -- each loss removes a fraction of the remainder.
+  P(ruin) then comes out 0 by construction and the metric becomes meaningless.
+  So pick a different failure definition before coding: budget drops below a floor
+  (e.g. $100, too small to trade), or just report the distribution of final P&L and
+  the worst drawdown along the path.
+  NOTE: because size depends on P&L and not on the date, the calendar stays
+  irrelevant -- 32,000 trades is 32,000 trades whether it is 500/day for 64 days or
+  250/day for 128.
+
+STEP 4 -- ADD FEES
+  Subtract p*(1-p)*0.07 per contract when taking. At p = 0.50 that is 1.75c against
+  a 5c edge -- 35% OF THE EDGE GONE. Does not change the structure of the sim, one
+  subtraction per trade, but it moves the answer a lot.
+
+--- UNIT TEST FOR STEP 1 (do not derive, just check against it) ---
+Gambler's ruin: for a +/-$X bet at a 55% win rate with a $1,000 floor, the chance of
+ever hitting the floor is about (0.45/0.55) ^ (1000/X):
+      $10  ->  essentially zero
+      $50  ->  ~2%
+      $100 ->  ~14%
+      $200 ->  ~37%
+Run the Monte Carlo at those four sizes. Land near these numbers -> logic is right.
+Miss them -> there is a bug.
+
+--- OTHER ASSUMPTIONS TO STATE EXPLICITLY ---
+- "Max loss tolerance $1,000" read as an ABSOLUTE FLOOR on cumulative P&L, not a
+  drawdown from peak. Those are different rules and give different answers.
+- 3 months: baseball plays nearly every day in season, so ~90 days (45,000 trades)
+  is arguably more defensible than 64 weekdays (32,000). Either is fine, just say
+  which one and why.
+- Over 32,000 trades the expected profit dwarfs the noise, so the entire question is
+  "how do I survive the first few hundred trades?" -- the early path, not the
+  terminal P&L.
+
+################# I told Jay ###################
+- That I found out that baseball run outcomes are roughly negative binomial distributed (I need to prove this using MLE or other method)
+- And the sum of totals (total runs from team A and team B) is basically a convolution integral, and we can assert how valid this approximation is by taking real world data of how these two team's total runs correlate to each other. We can actually estimate this correlation, and probably add an adjustment factor to the convolution to get the real-world implied total_across_2_teams based on what the total_A and total_B are getting priced as
+- I need to include these, and at least outline a first-order whiteboard plan for how I'd approach these, or discuss why they are important
+
+
+
+
+
+
 ########## Q1 MARKET EFFICIENCY -- METRIC DESIGN (discussion 08/17) ##########
 
 Plan: build one table, 33 rows, one row per market. Compare spread, depth, and
