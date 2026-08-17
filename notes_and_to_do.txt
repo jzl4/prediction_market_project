@@ -1,3 +1,116 @@
+########## Q1 MARKET EFFICIENCY -- METRIC DESIGN (discussion 08/17) ##########
+
+Plan: build one table, 33 rows, one row per market. Compare spread, depth, and
+volume across markets. Most of Q1 falls out of that table.
+
+--- FINDING: raw spread in cents cannot rank the markets ---
+The tick is 1 cent and the book sits at 1 tick almost always:
+    spread 0.01 -> 50,660 rows (86.9%)
+    spread 0.02 ->  5,952
+    spread 0.03 ->  1,592
+    spread 0.04 ->     71
+So median spread = 0.01 for nearly every market. Useless for ranking, ties 33 ways.
+(Also checked: zero NaN best_bid / best_ask, so no one-sided books to handle.)
+
+What DOES vary is where the market sits on the price ladder:
+    cheapest   TEAMTOTAL-PIT8   mid 0.085
+    richest    TOTAL-2          mid 0.965
+A 1-cent spread is 1.0% of price on TOTAL-2 and 19% on TEAMTOTAL-MIL8.
+=> use RELATIVE spread (spread / mid). That has real dispersion.
+
+--- but name the bias in relative spread ---
+It structurally favours expensive contracts, because the 1-cent tick is a floor
+nobody can quote inside. TOTAL-2 at 1 cent is not well-made, it is PINNED at the
+minimum possible spread. So report BOTH:
+    - spread in TICKS       = how good is the market-making, given what is allowed
+    - RELATIVE spread       = what it actually costs me to trade
+They answer different questions and they disagree, which is itself interesting.
+
+--- AGGREGATION: time-weight, do not take a median across rows ---
+Book rows are events, not clock ticks. Message counts differ 12x across markets,
+and inside one market the busy minutes generate far more rows than quiet ones.
+A median across rows answers "what was the spread on a typical MESSAGE", which
+oversamples exactly the active periods. We want "what was the spread on a typical
+SECOND". Weight each quote by how long it stood before the next book row replaced
+it: groupby.diff().shift(-1) gives the dwell time.
+
+Checked the dwell-weighting trap: largest gap in the books feed is 1.0 minute out
+of a 5.99-hour window (0.3%). Safe, no special handling needed.
+
+--- DROP max spread ---
+Only 4 distinct spread values exist, so max = 0.03 or 0.04 for most markets and we
+are back to ties. Use "% of time wider than 1 tick" instead. Same intent, full
+dispersion, already time-weighted.
+
+--- CONTRACTS vs DOLLAR NOTIONAL (the long back-and-forth) ---
+Both are right, they answer different questions. Report both columns.
+
+Why contracts is the payoff-relevant unit for Q1:
+every contract settles at exactly $0 or $1, so face value is IDENTICAL across all
+33 markets. Quantity is already the notional-equivalent -- 10,000 contracts is
+10,000 dollars of settlement exposure whether the market trades at 0.09 or 0.96.
+This is the OPPOSITE of stocks, where you multiply by price precisely because face
+values differ. Payoff scales with CONTRACTS, not capital: an edge of delta earns
+delta dollars per contract regardless of p.
+
+Why capital committed still matters -- same 3-cent edge, both books 10,000 deep:
+
+    market at p = 0.09          market at p = 0.50
+    think fair value is 0.12    think fair value is 0.53
+    buy 10,000 contracts:
+      cost           $900         cost           $5,000
+      EV at settle $1,200         EV at settle   $5,300
+      PROFIT         $300         PROFIT           $300   <- identical
+      ret on capital  33%         ret on capital      6%
+      max loss       $900         max loss       $5,000
+
+Same expected profit, 5.5x the capital, 5.5x the max loss, one fifth the return on
+capital. Contracts alone hides all of that. Max loss also feeds straight into Q4's
+$1,000 loss tolerance.
+
+If computing capital committed, it is SIDE-AWARE, not just qty * p:
+    resting BID of Q at price p ties up  Q * p        (what the buyer pays)
+    resting ASK of Q at price p ties up  Q * (1 - p)  (seller collects p, owes $1
+                                                       if it settles yes)
+Summing all 10 levels as qty * p would score the ask side of a 0.09 market at 9%
+of its real capital at risk instead of 91%.
+
+THE FINDING TO WRITE UP: where the two columns disagree. A market showing deep
+books in contracts but tiny capital committed is one where makers are risking very
+little to look liquid -- that is evidence about how seriously to take that depth.
+Better Q1 observation than either column alone.
+
+--- THE FEE DOMINATES THE SPREAD (probably the best Q1 insight) ---
+Fee is p*(1-p)*0.07, so it PEAKS at p = 0.50 and vanishes at the extremes.
+Cost to cross = half-spread + fee:
+
+    market            mid     spread  half-sprd   fee     total   as % of mid
+    TOTAL-2           0.965    1c      0.50c     0.24c    0.74c      0.8%
+    a mid-priced one  0.50     1c      0.50c     1.75c    2.25c      4.5%
+    TEAMTOTAL-MIL8    0.105    2c      1.00c     0.66c    1.66c     15.8%
+
+The fee is 3.5x the half-spread for a contract at 0.50. Ranking on spread alone
+gets the economics wrong. "Which market is cheapest to actually trade" is a more
+defensible reading of EFFICIENT than "which has the tightest quote", and the
+instructions hand us that fee formula for a reason.
+
+--- METRICS TO COMPUTE, per market (one table, 33 rows) ---
+ 1. time-weighted mean spread IN TICKS, and % of time wider than 1 tick
+ 2. time-weighted mean RELATIVE spread (spread / mid)
+ 3. time-weighted mean ROUND-TRIP COST = half-spread + p*(1-p)*0.07, as % of mid
+ 4. time-weighted median TOP-OF-BOOK depth in contracts (best bid sz + best ask sz)
+ 5. time-weighted median TOTAL TOP-5 depth in contracts, plus side-aware capital
+ 6. VOLUME in contracts and TRADE COUNT (2 of the 33 never traded at all)
+
+Reminder from the earlier discussion: books alone is not the whole Q1 answer.
+Quotes are cheap to post -- the PIT team-total chain is quoted tightly and trades
+27 times across 7 strikes, which is not an efficient market so much as an untested
+one. Effective spread needs trade prices, and the sharpest efficiency measure --
+how fast neighbouring strikes reprice after a large trade -- treats the trade as
+the information event.
+
+########## END Q1 MARKET EFFICIENCY -- METRIC DESIGN ##########
+
 ################# 
 
 More thoughts, based on trading intuition + some searching online:
