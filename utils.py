@@ -169,4 +169,121 @@ def show_window(b, t, start, seconds=1.0, depth=5, full=True, max_events=40):
         print()
 
 
+# ---------------------------------------------------------------------------
+# Q1 -- market efficiency metrics
+#
+# Each function takes the rows for ONE market and returns one number, so they
+# can be applied across all 33 markets and assembled into a table.
+#
+# TAKER_FEE_RATE is from the instructions: taking costs p*(1-p)*0.07 per
+# contract, where p is the price you actually pay. Making is free.
+# ---------------------------------------------------------------------------
 
+TAKER_FEE_RATE = 0.07
+
+
+def _one_market(b):
+    """Guard + sort. Every metric below assumes a single market in time order.
+
+    Passing a multi-market frame would silently corrupt the dwell times (the
+    gap between the last row of one market and the first row of the next is
+    not a dwell), so refuse it outright rather than return a wrong number.
+    """
+    n = b["native_id"].nunique()
+    if n != 1:
+        raise ValueError(f"expected rows for exactly 1 market, got {n}")
+    return b.sort_values("recv_ts_utc")
+
+
+def _dwell_seconds(b):
+    """How long each row's quote stood before the next message replaced it.
+
+    The feed only sends a message when something changes, so rows are events,
+    not clock ticks. This is the weight that converts "average per message"
+    into "average per second".
+
+    The last row has no successor, so its dwell is NaN and it drops out of the
+    weighted averages below. That loses one quote per market out of hundreds.
+    """
+    return b["recv_ts_utc"].diff().shift(-1).dt.total_seconds()
+
+
+def _weighted_mean(values, weights):
+    """Mean of `values` weighted by `weights`, ignoring rows where either is NaN."""
+    ok = values.notna() & weights.notna()
+    if not ok.any():
+        return float("nan")
+    return float((values[ok] * weights[ok]).sum() / weights[ok].sum())
+
+
+def _ladder_total_qty(side):
+    """Sum the quantities across one side's ladder (all 5 levels)."""
+    return sum(float(lvl["qty"]) for lvl in side)
+
+
+def time_weighted_relative_spread(b):
+    """Average spread as a fraction of mid price, weighted by time.
+
+    Relative, not raw cents, because the tick is 1 cent and the book sits at
+    1 tick in ~87% of rows -- raw cents ties nearly all 33 markets at 0.01.
+    Dividing by mid separates them: 1 cent is ~1% of a contract trading at
+    0.96 but ~19% of one trading at 0.105.
+
+    Returns a fraction (0.01 = 1% of mid). Multiply by 100 to report percent.
+    """
+    b = _one_market(b)
+    mid = (b["best_bid"] + b["best_ask"]) / 2
+    return _weighted_mean(b["spread"] / mid, _dwell_seconds(b))
+
+
+def median_total_quantity_top_5(b):
+    """Median resting depth in contracts: top 5 bids + top 5 asks, per row.
+
+    Contracts, not dollars. Every contract here settles at exactly $0 or $1,
+    so face value is identical across all 33 markets and quantity is already
+    the notional-equivalent -- unlike stocks, where you multiply by price
+    because face values differ.
+
+    Note this one is event-weighted, not time-weighted like the spread
+    metrics. A median only depends on ordering, so it is far less distorted by
+    busy periods producing extra messages than a mean would be. Kept as a
+    median for simplicity; switch to a dwell-weighted mean if it ever matters.
+    """
+    b = _one_market(b)
+    depth = b["bids"].map(_ladder_total_qty) + b["asks"].map(_ladder_total_qty)
+    return float(depth.median())
+
+
+def total_volume_traded(t):
+    """Total contracts traded in this market over the whole window.
+
+    Takes the TRADES frame, not the books frame. Returns 0.0 for a market that
+    never traded -- 2 of the 33 are quoted but never print.
+    """
+    if len(t) == 0:
+        return 0.0
+    t = _one_market(t)
+    return float(t["qty"].sum())
+
+
+def time_weighted_cost_to_cross(b):
+    """What it actually costs a taker to buy, as a fraction of mid, time-weighted.
+
+    Two components, both per contract:
+      1. half-spread -- lifting the ask means paying (best_ask - mid)
+      2. taker fee   -- p*(1-p)*0.07, where p is the price paid, so best_ask.
+         This matches the instructions' example: at 0.49/0.50, taking costs
+         0.50*0.50*0.07 on top of the 0.50.
+
+    Worth computing separately from the spread because the fee peaks at
+    p = 0.50 and vanishes at the extremes, so it reorders the ranking: at
+    p = 0.50 the fee is ~1.75 cents against a 0.5 cent half-spread.
+
+    Priced from the buy side for a single comparable number. The sell side is
+    the mirror image and gives the same ranking.
+    """
+    b = _one_market(b)
+    mid = (b["best_bid"] + b["best_ask"]) / 2
+    half_spread = b["best_ask"] - mid
+    fee = b["best_ask"] * (1 - b["best_ask"]) * TAKER_FEE_RATE
+    return _weighted_mean((half_spread + fee) / mid, _dwell_seconds(b))
