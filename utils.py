@@ -472,3 +472,132 @@ def plot_pnl_paths(paths, loss_limit=-1000.0, zoom=1000, max_points=2000, axes=N
     ], fontsize=8.5, frameon=False, loc="upper left")
 
     return axes
+
+
+# ---------------------------------------------------------------------------
+# Q4b step 2 -- trading the price move, not holding to settlement
+#
+# The signal calls the next move up or down with `signal_accuracy`. We enter at
+# p and exit once the price has moved `delta` either way. This is the reading
+# the prompt supports: 500 UNCORRELATED trades per day is impossible if we hold
+# to settlement, because every position on one game shares a single outcome.
+#
+# Four scenarios, since the exit price -- and therefore the exit fee -- depends
+# on both which way we traded and whether the signal was right:
+#
+#     buy,  right   ->  exit at p + delta      0.5 * accuracy
+#     sell, right   ->  exit at p - delta      0.5 * accuracy
+#     buy,  wrong   ->  exit at p - delta      0.5 * (1 - accuracy)
+#     sell, wrong   ->  exit at p + delta      0.5 * (1 - accuracy)
+#
+# P(buy) is 0.5 because signal-says-up = 0.5*acc + 0.5*(1-acc) = 0.5.
+# ---------------------------------------------------------------------------
+
+def _fill_price(mid, side, spread, taking):
+    """Price actually filled at, given the mid and whether we crossed.
+
+    side = +1 to buy, -1 to sell.
+
+    Taking means crossing: a buyer lifts the ask at mid + spread/2, a seller
+    hits the bid at mid - spread/2. Either way half the spread is paid away.
+
+    Making means resting: a buyer's bid sits at mid - spread/2 and gets hit, a
+    seller's offer sits at mid + spread/2 and gets lifted. Half the spread is
+    EARNED rather than paid. That sign flip is the whole reason passive
+    execution is the only version of this strategy that clears its costs.
+    """
+    return mid + (spread / 2.0) * side * (1.0 if taking else -1.0)
+
+
+def simulate_signal_trades(p=0.50, delta=0.10, spread=0.01, signal_accuracy=0.55,
+                           n_contracts=100, n_trades=32_000,
+                           take_on_entry=True, take_on_exit=True, seed=0):
+    """Monte Carlo of a directional signal traded in and out of the book.
+
+    p               -- entry price (mid). The market's level.
+    delta            -- how far the price moves before we exit.
+    spread           -- full bid/ask spread. Crossing to exit costs this once
+                        per round trip: a long sells the bid, a short buys the
+                        ask, so the exit price is worse by `spread` either way.
+    signal_accuracy  -- how often the signal calls the direction right.
+    n_contracts      -- position size, so P&L is in dollars not cents/contract.
+    take_on_entry /
+    take_on_exit     -- whether each leg crosses (pays p*(1-p)*0.07) or rests
+                        passively (free). Making is the only way this strategy
+                        clears its costs at realistic move sizes.
+
+    Prices are clipped to [0, 1]: at p = 0.95 with delta = 0.10 the upside
+    truncates at 1.0 (a 0.05 win) while the downside stays a full 0.10, so
+    extreme markets are structurally worse for this strategy.
+
+    Returns a dict including the per-trade P&L and its cumulative sum, so the
+    path can be plotted directly.
+    """
+    rng = np.random.default_rng(seed)
+
+    # +1 = we bought, -1 = we sold. Independent of whether the signal is right.
+    direction = np.where(rng.random(n_trades) < 0.5, 1.0, -1.0)
+    right     = rng.random(n_trades) < signal_accuracy
+
+    # Which way the market actually went. Buy+right and sell+wrong mean it rose.
+    move = direction * np.where(right, 1.0, -1.0)
+    exit_mid = np.clip(p + delta * move, 0.0, 1.0)
+
+    entry_px = np.clip(_fill_price(p, direction, spread, take_on_entry), 0.0, 1.0)
+    # Exiting reverses the trade: closing a long means selling, so the same
+    # helper with the same `direction` gives the right sign on the other leg.
+    exit_px  = np.clip(_fill_price(exit_mid, -direction, spread, take_on_exit), 0.0, 1.0)
+
+    gross = direction * (exit_px - entry_px)           # per contract, in dollars
+
+    fee_in  = entry_px * (1 - entry_px) * TAKER_FEE_RATE if take_on_entry else 0.0
+    fee_out = exit_px * (1 - exit_px) * TAKER_FEE_RATE if take_on_exit else 0.0
+
+    per_contract = gross - fee_in - fee_out
+    per_trade    = per_contract * n_contracts
+
+    return {
+        "p": p, "delta": delta, "spread": spread,
+        "signal_accuracy": signal_accuracy, "n_contracts": n_contracts,
+        "take_on_entry": take_on_entry, "take_on_exit": take_on_exit,
+        "ev_per_contract": float(per_contract.mean()),
+        "ev_per_contract_exact": signal_trade_ev(
+            p, delta, spread, signal_accuracy, take_on_entry, take_on_exit),
+        "ev_per_trade": float(per_trade.mean()),
+        "total_pnl": float(per_trade.sum()),
+        "per_trade": per_trade,
+        "pnl_path": np.cumsum(per_trade),
+    }
+
+
+def signal_trade_ev(p=0.50, delta=0.10, spread=0.01, signal_accuracy=0.55,
+                    take_on_entry=True, take_on_exit=True):
+    """Exact expected P&L per contract, by enumerating the four scenarios.
+
+    No simulation involved -- this is what the Monte Carlo above should converge
+    to, so it doubles as a check on it.
+    """
+    acc = signal_accuracy
+    scenarios = [                       # (direction, signal right, probability)
+        ( 1.0, True,  0.5 * acc),       # buy,  right
+        (-1.0, True,  0.5 * acc),       # sell, right
+        ( 1.0, False, 0.5 * (1 - acc)), # buy,  wrong
+        (-1.0, False, 0.5 * (1 - acc)), # sell, wrong
+    ]
+
+    clip = lambda x: min(max(x, 0.0), 1.0)
+
+    ev = 0.0
+    for direction, is_right, prob in scenarios:
+        move     = direction * (1.0 if is_right else -1.0)
+        exit_mid = clip(p + delta * move)
+
+        entry_px = clip(_fill_price(p, direction, spread, take_on_entry))
+        exit_px  = clip(_fill_price(exit_mid, -direction, spread, take_on_exit))
+
+        gross   = direction * (exit_px - entry_px)
+        fee_in  = entry_px * (1 - entry_px) * TAKER_FEE_RATE if take_on_entry else 0.0
+        fee_out = exit_px * (1 - exit_px) * TAKER_FEE_RATE if take_on_exit else 0.0
+        ev     += prob * (gross - fee_in - fee_out)
+
+    return float(ev)

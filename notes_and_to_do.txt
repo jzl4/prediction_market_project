@@ -1,5 +1,93 @@
 
 
+########################## Revised simulation for 4B ##############################
+
+- What does the edge of 0.05 (55% win rate) mean in a market where you can buy or sell at price p?
+- Let's assume that the market moves up or down 50% of the time. This is a reasonable assumption because markets are generally a random walk in short intervals of time
+- You can predict this direction correctly 55% of the time - this is the signal that you have that gives you a 5% edge over random coin toss
+- And assume that you get out of your trade after making or lose an amount delta, something like 0.1 or 0.2
+- So for example, if you buy at p = 0.3, and delta = 0.1, you exit when p hits either $0.4 (you were right and made $0.1) or p hits $0.2 (you were wrong and lost $0.1)
+
+- THE SPREAD: assume the bid/ask spread is $0.01, and p is the MID price. So the
+  best bid is (p - 0.005) and the best ask is (p + 0.005).
+  * If I am ACTIVE (a taker), I buy at the ask and sell at the bid. I pay away
+    half the spread on the way in and half on the way out => I LOSE $0.01 per
+    round trip, on top of the fees.
+  * If I am PASSIVE (a maker), my resting bid gets hit at (p - 0.005) and my
+    resting offer gets lifted at (p + 0.005). I COLLECT half the spread on the
+    way in and half on the way out => I MAKE $0.01 per round trip, and pay no
+    fees at all, because making is free.
+  * So the spread swings a full $0.02 per round trip between being a taker and
+    being a maker. That is bigger than delta itself at realistic move sizes.
+
+- So there are 4 possible scenarios.  Let's walk through the 4 scenarios.
+  Shown for the ACTIVE / taker case; the passive case is the same but with
+  +0.005 instead of -0.005 at each leg, and with both fee terms deleted.
+
+- I buy the contract at p and my signal was right
+- I bought at (p + 0.005), I exit by selling at (p + delta - 0.005)
+- Net move captured is (delta - 0.01), not delta -- the spread ate a penny
+- I paid (p+0.005)*(1-p-0.005)*0.07 fee on the way in, and
+  (p+delta-0.005)*(1-p-delta+0.005)*0.07 fee on the way out
+- Net P&L = (delta - 0.01) - fee_in - fee_out
+- This happens 0.5 x 0.55 = 27.5% of the time.  Generally: 0.5 x (signal win rate)
+
+- I sell the contract at p and my signal was right
+- I sold at (p - 0.005), and I bought back at (p - delta + 0.005)
+- Net move captured is (delta - 0.01)
+- I paid (p-0.005)*(1-p+0.005)*0.07 on the way in, and
+  (p-delta+0.005)*(1-p+delta-0.005)*0.07 on the way out
+- Net P&L = (delta - 0.01) - fee_in - fee_out
+- This happens 0.5 x 0.55 = 27.5% of the time.  Generally: 0.5 x (signal win rate)
+
+- I buy the contract at p and my signal was wrong
+- I bought at (p + 0.005), I exit by selling at (p - delta - 0.005)
+- Net loss is (delta + 0.01) -- the spread makes the loss WORSE, not better
+- I paid (p+0.005)*(1-p-0.005)*0.07 on the way in, and
+  (p-delta-0.005)*(1-p+delta+0.005)*0.07 on the way out
+- Net P&L = -(delta + 0.01) - fee_in - fee_out
+- This happens 0.5 x 0.45 = 22.5% of the time.  Generally: 0.5 x (1 - signal win rate)
+
+- I sell the contract at p and my signal was wrong
+- I sold at (p - 0.005), and I buy it back at (p + delta + 0.005)
+- Net loss is (delta + 0.01)
+- I paid (p-0.005)*(1-p+0.005)*0.07 on the way in, and
+  (p+delta+0.005)*(1-p-delta-0.005)*0.07 on the way out
+- Net P&L = -(delta + 0.01) - fee_in - fee_out
+- This happens 0.5 x 0.45 = 22.5% of the time.    Generally: 0.5 x (1 - signal win rate)
+
+One more caveat: assume that (p + delta) is capped at 1.0.  For example, if p = 0.95, and delta = 0.1, we can't actually trade at 1.05 because max is 1.0.  Similarly, assume that (p - delta) is floor at 0.0 (it cannot be below 0.0)
+
+Now run this simulation for 32,000 trials, and plot out the cumsum (running sum) of P&L from trade 1 to trade 32,000
+
+Write a function for making this simulation, with delta as an input (default value of 0.1), and signal accuracy as an input (assume 55% for now)
+
+--- TWO SIMULATIONS TO RUN AND PLOT ---
+  SIM A: ACTIVE. Pay the fee on both legs and pay away the $0.01 spread.
+         Expect this to be clearly unprofitable at a 55% win rate.
+  SIM B: PASSIVE, best case. Assume every resting bid and offer gets filled, so
+         there are no fees at all and we COLLECT the $0.01 spread.
+         This is the optimistic bound, not a realistic plan.
+
+--- WHAT THE DATA SAYS ABOUT DELTA (checked against the real book) ---
+- Largest full-session price range of ANY of the 33 markets: 0.035
+- Median session range across the 33 markets: 0.015
+- Largest single 5-minute move seen anywhere: 0.030
+- So delta = 0.10 NEVER HAPPENS in this dataset. We would enter trades and never
+  close them. A realistic delta is 0.01 to 0.03.
+- Caveat: this is one 6-hour session. Over days or weeks the market would move
+  more. But we cannot check that with the data we were given, so state it as an
+  assumption rather than a fact.
+
+--- WHERE 500 TRADES PER DAY PROBABLY COMES FROM ---
+- MLB plays about 15 games a day, and each game has 33 markets: 15 x 33 = 495.
+- So it is roughly ONE trade per market per day, not 500 round trips in a single
+  market. That resolves the "the market doesn't move enough" objection.
+- But those 500 are not really uncorrelated: the 33 markets on one game all
+  settle off the same nine innings. The genuinely independent count is closer to
+  15 per day. Independence is an assumption we are handed, so state it and move
+  on rather than pretending it holds.
+
 
 
 ####################### Simulation of 4B #########################
