@@ -1,3 +1,5 @@
+This is the goal / purpose of this case study - I need to answer these 4 questions and submit my analysis
+
 The attached files contain both orderbook delta and trade data on an MLB Game.
 
 Questions / Tasks
