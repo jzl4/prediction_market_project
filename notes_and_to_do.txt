@@ -1,5 +1,18 @@
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 ########################## Revised simulation for 4B ##############################
 
 - What does the edge of 0.05 (55% win rate) mean in a market where you can buy or sell at price p?
