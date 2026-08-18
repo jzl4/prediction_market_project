@@ -601,3 +601,98 @@ def signal_trade_ev(p=0.50, delta=0.10, spread=0.01, signal_accuracy=0.55,
         ev     += prob * (gross - fee_in - fee_out)
 
     return float(ev)
+
+
+# ===========================================================================
+# Q1 METRICS -- for q1_market_efficiency_new.ipynb
+#
+# These three functions belong to the NEW Q1 notebook and follow the
+# definitions written there. They are deliberately separate from the older
+# Q1 block above (time_weighted_relative_spread, time_weighted_cost_to_cross,
+# median_total_quantity_top_5, total_volume_traded), which belongs to
+# q1_market_efficiency_claude.ipynb and is kept only so that notebook still
+# runs. Do not mix the two sets: they normalise differently and will not agree.
+#
+# What changed between the two:
+#   - spread is now divided by p*(1-p), not by the mid. Dividing by the mid
+#     silently assumes the trader is buying "yes"; s/(p*(1-p)) is the sum of
+#     the cost in both directions and does not change when p and (1-p) swap.
+#   - the aggregator across time is the MEDIAN for both spread and depth,
+#     not a dwell-weighted mean.
+# ===========================================================================
+
+
+def median_relative_trading_cost(b):
+    """(1) Median cost of crossing the spread, as a fraction of capital deployed.
+
+    Per row of the books frame -- snapshot and update alike, since both carry a
+    complete photo of the book -- compute
+
+        s / (p * (1 - p))
+
+    where s = best_ask - best_bid and p = the mid, (best_bid + best_ask) / 2.
+
+    Why that denominator rather than the mid: buying "yes" deploys p of capital
+    and costs s/p; selling "yes" deploys (1 - p) and costs s/(1 - p). Summing
+    the two directions gives s/p + s/(1-p) = s/(p*(1-p)), which is unchanged
+    when p and (1-p) swap places. So it measures the market, not whichever
+    direction we happened to pick.
+
+    Takes the MEDIAN across all rows in the window, per the notebook's
+    instruction. A median depends only on ordering, so unlike a mean it is not
+    dragged around by the handful of rows where the book was briefly wide.
+
+    Returns a fraction: 0.11 means 11% of capital deployed.
+    """
+    b = _one_market(b)
+
+    # p and s straight off the top of book, one value per photo of the ladder
+    mid = (b["best_bid"] + b["best_ask"]) / 2
+    spread = b["best_ask"] - b["best_bid"]
+
+    # cost in both directions at once; mid is never 0 or 1 in this data, so
+    # the denominator cannot vanish
+    cost = spread / (mid * (1 - mid))
+
+    return float(cost.median())
+
+
+def median_order_book_depth(b):
+    """(2) Median resting size across both sides of the book.
+
+    Per row, add up the qty at every level the feed gives us -- up to 5 bids
+    and up to 5 asks -- then take the median of that total across the window.
+
+    Short ladders are counted as-is, not padded or dropped. The ask side has
+    fewer than 5 levels in about 4.5% of rows, and a book quoting only 2 or 3
+    levels really is thinner than one quoting 5, so letting the sum come out
+    smaller is the correct behaviour rather than a gap to patch.
+
+    Units are whatever the feed's qty field is denominated in. It is almost
+    certainly not a plain contract count -- only 41.7% of trade quantities are
+    integers, while qty * 100 is an integer 100% of the time -- but the unit is
+    consistent across all 33 markets, so it ranks them correctly either way.
+    """
+    b = _one_market(b)
+
+    # _ladder_total_qty sums whatever levels are present on one side
+    depth = b["bids"].map(_ladder_total_qty) + b["asks"].map(_ladder_total_qty)
+
+    return float(depth.median())
+
+
+def total_contracts_traded(t):
+    """(3) Total quantity traded in this market over the whole window.
+
+    Takes the TRADES frame, not the books frame. Every trade's qty is added to
+    a running total; this is a flow over the session, not a state, so there is
+    no mean-vs-median choice to make -- it is simply a sum.
+
+    Returns 0.0 for a market that is quoted but never prints. Two of the 33 are
+    in that position, so this cannot be left to raise.
+    """
+    if len(t) == 0:
+        return 0.0
+
+    t = _one_market(t)
+    return float(t["qty"].sum())
