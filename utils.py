@@ -696,3 +696,274 @@ def total_contracts_traded(t):
 
     t = _one_market(t)
     return float(t["qty"].sum())
+
+
+# ===========================================================================
+# Q1 (4) ARBITRAGE / INTERNAL CONSISTENCY -- for q1_market_efficiency_new.ipynb
+#
+# Every contract here is a survival probability S(n) = P(runs >= n), so a set
+# of known inequalities must hold between them at any single instant. We walk
+# the book feed in time order and test every one we can observe.
+#
+# The hard part is not the inequalities, it is TIME. Adjacent strikes never
+# share a timestamp (F5TOTAL-5 and F5TOTAL-6 have 0 timestamps in common out
+# of 954 and 876), so any comparison pairs a fresh quote against an older one.
+# And we cannot assume an old quote is still valid: 66% of trades land inside
+# a gap of >5s in the book feed, which proves the feed does NOT report every
+# change. So each cached quote carries its age and is discarded once it goes
+# past a freshness threshold.
+#
+# Prices compared are MIDS. That is a screen, not a compromise: an executable
+# arbitrage needs bid(m) > ask(n) for n < m, and since ask(n) > mid(n) and
+# mid(m) > bid(m), that implies mid(m) > mid(n). Every executable violation is
+# therefore also a mid violation, so finding none on mids PROVES none are
+# executable and no fee/spread analysis is needed.
+# ===========================================================================
+
+GAME_STAMP = "-26AUG051940PITMIL"
+
+
+def market_short_name(native_id):
+    """Strip the shared game stamp so market names are readable."""
+    return native_id.replace(GAME_STAMP, "")
+
+
+def parse_chain_and_strike(short_name):
+    """Split a market name into (chain, strike).
+
+    The strike suffix IS the survival strike: KXMLBTOTAL-8 carries line 7.5,
+    i.e. "over 7.5 runs", i.e. P(runs >= 8). Verified against the `line`
+    column for all 33 markets -- line is always (strike - 0.5).
+
+    The four ladders are returned as distinct chains. TEAMTOTAL in particular
+    must split into MIL and PIT: those are different random variables (each
+    team's own runs), so there is NO ordering constraint between them and
+    comparing across them would manufacture fake violations.
+
+    RFI is a single binary with no ladder, so it gets strike 1 (its line is
+    0.5, "at least 1 run in the 1st inning") and a chain of its own. It never
+    participates in a monotonicity test -- there is nothing to be monotone
+    against -- but it does take part in the nesting test below.
+    """
+    if short_name.startswith("KXMLBRFI"):
+        return "RFI", 1
+    if short_name.startswith("KXMLBTEAMTOTAL-MIL"):
+        return "TEAMTOTAL-MIL", int(short_name.rsplit("MIL", 1)[1])
+    if short_name.startswith("KXMLBTEAMTOTAL-PIT"):
+        return "TEAMTOTAL-PIT", int(short_name.rsplit("PIT", 1)[1])
+    if short_name.startswith("KXMLBF5TOTAL-"):
+        return "F5TOTAL", int(short_name.rsplit("-", 1)[1])
+    if short_name.startswith("KXMLBTOTAL-"):
+        return "TOTAL", int(short_name.rsplit("-", 1)[1])
+    raise ValueError(f"unrecognised market name: {short_name}")
+
+
+def market_label(short_name):
+    """Short readable label for the logs, e.g. 'S_TOTAL(7)', 'S_MIL(5)'."""
+    chain, strike = parse_chain_and_strike(short_name)
+    pretty = {"F5TOTAL": "F5", "TEAMTOTAL-MIL": "MIL",
+              "TEAMTOTAL-PIT": "PIT", "TOTAL": "TOTAL", "RFI": "RFI"}[chain]
+    return f"S_{pretty}({strike})"
+
+
+def build_constraint_pairs(short_names):
+    """All ordered pairs (a, b) for which the constraint says S_a <= S_b.
+
+    Returns {(a, b): rule_description}. Looking up a pair in BOTH orders tells
+    you whether two markets are comparable at all, and if so which direction
+    the inequality runs. Markets with no entry either way -- MIL against PIT,
+    say -- are simply skipped by the engine, with no special-case code.
+
+    The four families of constraint:
+
+    1. WITHIN-CHAIN MONOTONICITY. S(n) = P(runs >= n) is a survival function,
+       so it is non-increasing in n. Every game with 5+ runs is also a game
+       with 4+ runs. Checked for ALL pairs of strikes in a chain, not just
+       adjacent ones: because of the freshness filter we often will not have
+       two adjacent strikes fresh at the same moment, and restricting to
+       adjacent pairs would throw most comparisons away for nothing.
+
+    2. RFI NESTS INSIDE F5. Inning 1 is contained in innings 1-5, so runs in
+       the 1st <= runs in the first five, on every single game. Testable at
+       the one strike they share, n = 1.
+
+    3. F5 NESTS INSIDE THE FULL GAME. Innings 1-5 are contained in innings
+       1-9. Shared strikes n = 2..7.
+
+    4. EITHER TEAM NESTS INSIDE THE GAME TOTAL. Runs are non-negative, so if
+       Milwaukee alone scores 5 the game total is automatically >= 5. Shared
+       strikes n = 2..8. Note this is the weak `max` bound and NOT the
+       convolution: the distribution of a sum only equals the convolution of
+       the marginals if the two are independent, and two teams in the same
+       game are not.
+    """
+    parsed = {m: parse_chain_and_strike(m) for m in short_names}
+    by_chain = {}
+    for m, (chain, strike) in parsed.items():
+        by_chain.setdefault(chain, {})[strike] = m
+
+    pairs = {}
+
+    # --- 1. within-chain monotonicity, all pairs of strikes -----------------
+    for chain, strikes in by_chain.items():
+        if chain == "RFI":
+            continue                      # single contract, nothing to compare
+        ks = sorted(strikes)
+        for i, n in enumerate(ks):
+            for m in ks[i + 1:]:          # m > n, so S(m) must be <= S(n)
+                pairs[(strikes[m], strikes[n])] = (
+                    f"{chain} monotonicity: S({m}) <= S({n})")
+
+    # --- 2/3/4. nesting across chains, at strikes the two chains share ------
+    def add_nesting(inner_chain, outer_chain, why):
+        inner, outer = by_chain.get(inner_chain, {}), by_chain.get(outer_chain, {})
+        for strike in sorted(set(inner) & set(outer)):
+            pairs[(inner[strike], outer[strike])] = f"{why} at strike {strike}"
+
+    add_nesting("RFI",           "F5TOTAL", "inning 1 nests in innings 1-5")
+    add_nesting("F5TOTAL",       "TOTAL",   "innings 1-5 nest in the full game")
+    add_nesting("TEAMTOTAL-MIL", "TOTAL",   "MIL runs nest in the game total")
+    add_nesting("TEAMTOTAL-PIT", "TOTAL",   "PIT runs nest in the game total")
+
+    return pairs
+
+
+def describe_violation(v):
+    """Render one violation as a human-readable block.
+
+    Shows both quotes with their own timestamps, how far apart they were, and
+    which rule broke and by how much -- so anomalies can be read and sanity
+    checked rather than only counted.
+    """
+    fmt = lambda ts: pd.Timestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+    return (f"{fmt(v['t_earlier'])}  {v['label_earlier']:<12} mid {v['mid_earlier']:.3f}\n"
+            f"{fmt(v['t_later'])}  {v['label_later']:<12} mid {v['mid_later']:.3f}"
+            f"   ({v['gap_seconds']:.3f} s later)\n"
+            f"-> violates {v['rule']} by {v['violation_cents']:.1f}c")
+
+
+def check_arbitrage_violations(books, freshness_seconds=1.0):
+    """Walk the book feed in time order and test every observable constraint.
+
+    Algorithm, one pass in chronological order:
+      - keep a cache holding the LATEST quote per market (dict keyed by market,
+        so a market updating three times inside the window leaves one entry,
+        not three)
+      - on each arriving book, first evict every cached quote older than
+        `freshness_seconds`
+      - then compare the arriving quote against each surviving cached quote
+        that has a known constraint direction, and record any violation
+      - finally insert the arriving quote into the cache
+
+    One row per DETECTION, not per episode. We cannot know when a violation
+    ended -- the pair may simply go stale before we see it again -- and it does
+    not matter: two mutually inconsistent prices observed within
+    `freshness_seconds` of each other is the data point. No censoring logic.
+
+    Returns a dict with the violations frame, the readable log, and the
+    comparison count that forms the denominator.
+    """
+    b = books.copy()
+    b["recv_ts_utc"] = pd.to_datetime(b["recv_ts_utc"], utc=True, format="ISO8601")
+    b["market"] = b["native_id"].map(market_short_name)
+    b = b.sort_values("recv_ts_utc")
+
+    constraints = build_constraint_pairs(sorted(b["market"].unique()))
+    labels = {m: market_label(m) for m in b["market"].unique()}
+
+    cache = {}                 # market -> (timestamp, mid)
+    violations, n_comparisons = [], 0
+
+    # Tightest slack ever seen on each rule, in cents. Slack = (S_b - S_a),
+    # the room left before the constraint would break. A null result is only
+    # meaningful alongside this: "no violations" is unimpressive if the strikes
+    # were never anywhere near each other.
+    tightest = {}
+    window = pd.Timedelta(seconds=freshness_seconds)
+
+    for row in b.itertuples(index=False):
+        now, mkt = row.recv_ts_utc, row.market
+        mid_now = (row.best_bid + row.best_ask) / 2
+
+        # evict anything that has gone stale as of this instant
+        for other in [k for k, (ts, _) in cache.items() if now - ts > window]:
+            del cache[other]
+
+        for other, (ts_other, mid_other) in cache.items():
+            if other == mkt:
+                continue
+
+            # is this pair comparable, and if so in which direction?
+            # (a, b) in constraints means the rule requires S_a <= S_b
+            if (mkt, other) in constraints:
+                a, b_, mid_a, mid_b = mkt, other, mid_now, mid_other
+            elif (other, mkt) in constraints:
+                a, b_, mid_a, mid_b = other, mkt, mid_other, mid_now
+            else:
+                continue                    # no known relationship -- skip
+
+            n_comparisons += 1
+
+            slack_cents = 100 * (mid_b - mid_a)
+            rule = constraints[(a, b_)]
+            if rule not in tightest or slack_cents < tightest[rule]:
+                tightest[rule] = slack_cents
+
+            if mid_a <= mid_b:
+                continue                    # constraint holds
+
+            # violation: record which quote arrived first for the log
+            earlier_is_cached = ts_other < now
+            violations.append({
+                "t_earlier":       ts_other if earlier_is_cached else now,
+                "t_later":         now if earlier_is_cached else ts_other,
+                "label_earlier":   labels[other] if earlier_is_cached else labels[mkt],
+                "label_later":     labels[mkt] if earlier_is_cached else labels[other],
+                "mid_earlier":     mid_other if earlier_is_cached else mid_now,
+                "mid_later":       mid_now if earlier_is_cached else mid_other,
+                "gap_seconds":     abs((now - ts_other).total_seconds()),
+                "market_a":        a,
+                "market_b":        b_,
+                "rule":            constraints[(a, b_)],
+                "mid_a":           mid_a,
+                "mid_b":           mid_b,
+                "violation_cents": 100 * (mid_a - mid_b),
+                "threshold_s":     freshness_seconds,
+            })
+
+        cache[mkt] = (now, mid_now)
+
+    v = pd.DataFrame(violations)
+    slack = (pd.Series(tightest, name="tightest_slack_cents")
+               .sort_values().rename_axis("rule").to_frame())
+    return {
+        "violations":    v,
+        "log":           [describe_violation(x) for x in violations],
+        "slack":         slack,
+        "n_comparisons": n_comparisons,
+        "n_violations":  len(violations),
+        "n_constraints": len(constraints),
+        "threshold_s":   freshness_seconds,
+    }
+
+
+def arbitrage_sensitivity(books, thresholds=(1.0, 2.0, 5.0, 30.0)):
+    """Re-run the check at several freshness thresholds and summarise.
+
+    If violations only appear at loose thresholds, they are artifacts of the
+    feed going quiet rather than real market failures -- which is exactly what
+    this table is for.
+    """
+    rows = []
+    for t in thresholds:
+        r = check_arbitrage_violations(books, freshness_seconds=t)
+        worst = r["violations"]["violation_cents"].max() if r["n_violations"] else 0.0
+        rows.append({
+            "threshold_s":   t,
+            "comparisons":   r["n_comparisons"],
+            "violations":    r["n_violations"],
+            "violation_%":   100 * r["n_violations"] / max(r["n_comparisons"], 1),
+            "worst_cents":   worst,
+            "tightest_slack_cents": r["slack"]["tightest_slack_cents"].min(),
+        })
+    return pd.DataFrame(rows).set_index("threshold_s")
