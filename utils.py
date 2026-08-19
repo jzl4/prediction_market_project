@@ -1183,6 +1183,10 @@ def walk_total_chain(books, freshness_seconds=Q2_FRESHNESS_SECONDS,
     events = pd.DataFrame(rows, columns=["recv_ts_utc", "mean_staleness",
                                          "max_staleness", "entropy",
                                          "variance", "E_runs"])
+    # Timestamps came off .values as naive datetime64; they are UTC, so say so.
+    # Without this the index prints without a zone and will not compare against
+    # tz-aware Timestamps.
+    events["recv_ts_utc"] = pd.to_datetime(events["recv_ts_utc"], utc=True)
     return events.set_index("recv_ts_utc")
 
 
