@@ -967,3 +967,357 @@ def arbitrage_sensitivity(books, thresholds=(1.0, 2.0, 5.0, 30.0)):
             "tightest_slack_cents": r["slack"]["tightest_slack_cents"].min(),
         })
     return pd.DataFrame(rows).set_index("threshold_s")
+
+
+# ============================================================================
+# Q2 -- "At what 1-minute interval would you be least certain about how many
+# runs there will be in the game?"
+#
+# These functions are for q2_least_certain_num_of_runs.ipynb ONLY. They are a
+# separate set from the Q1 metrics above; do not mix them.
+#
+# The idea: the KXMLBTOTAL chain is a ladder of survival probabilities
+# S(n) = P(runs >= n). Differencing adjacent strikes turns it into a PMF over
+# game run totals, from which entropy, E[runs] and variance follow. The PMF
+# needs all 11 strikes AT ONCE, so it is only computed when every strike was
+# quoted within a freshness threshold -- max gates, mean describes.
+# ============================================================================
+
+TOTAL_CHAIN = "TOTAL"          # chain name returned by parse_chain_and_strike
+Q2_FRESHNESS_SECONDS = 10.0    # default gate: every strike must be this fresh
+Q2_TAIL_VALUE = 13.0           # numeric label for the open-ended ">= 12" bucket
+
+
+# ---------------------------------------------------------------- layer 1 ---
+# Chain extraction: get the strike ladder, and read it out of the walk's cache.
+
+def total_chain_strikes(books):
+    """Discover the KXMLBTOTAL strike ladder present in the book feed.
+
+    Selects only the KXMLBTOTAL chain. This matters: KXMLBF5TOTAL,
+    KXMLBTEAMTOTAL and KXMLBRFI all begin with 'KXMLB', and a loose substring
+    match would silently pull in strikes belonging to a different random
+    variable. parse_chain_and_strike names the chain explicitly, so we keep
+    only chain == 'TOTAL'.
+
+    Input : books -- DataFrame of order book rows, needs column 'native_id'
+    Output: sorted list of int strikes, e.g. [2, 3, ..., 12]
+
+    Asserts the strikes are contiguous. A missing middle strike would make
+    differencing silently wrong rather than raise.
+    """
+    strikes = set()
+    for native_id in books["native_id"].unique():
+        chain, strike = parse_chain_and_strike(market_short_name(native_id))
+        if chain == TOTAL_CHAIN:
+            strikes.add(strike)
+
+    strikes = sorted(strikes)
+    assert strikes, "no KXMLBTOTAL markets found in the book feed"
+    assert strikes == list(range(strikes[0], strikes[-1] + 1)), (
+        f"KXMLBTOTAL strikes are not contiguous: {strikes}")
+    return strikes
+
+
+def get_total_ladder(mids, strikes):
+    """Read the survival ladder out of the cache, ordered by strike ascending.
+
+    Input : mids    -- dict {short_name: latest mid price}, the walk's cache
+            strikes -- the list from total_chain_strikes
+    Output: np.ndarray of 11 mid prices, [S(2), S(3), ..., S(12)]
+
+    Asserts every strike is present. A short ladder produces a PMF that looks
+    perfectly well formed and is wrong, so this fails loudly rather than
+    returning something shorter.
+    """
+    names = [f"KXMLB{TOTAL_CHAIN}-{k}" for k in strikes]
+    missing = [n for n in names if n not in mids]
+    assert not missing, f"ladder incomplete, missing {missing}"
+    return np.array([mids[n] for n in names], dtype=float)
+
+
+# ---------------------------------------------------------------- layer 2 ---
+# Distribution maths. Pure functions on numpy arrays -- no pandas, no state.
+
+def ladder_to_pmf(S):
+    """Difference a survival ladder into a probability mass function.
+
+    S(n) = P(runs >= n), so adjacent differences give P(runs = exactly n),
+    with a censored lump at each end that the ladder cannot resolve:
+
+        pmf = [1 - S[0]]  +  [S[i] - S[i+1]]  +  [S[-1]]
+            =  P(runs <= 1),   P(runs = 2..11),   P(runs >= 12)
+
+    Input : S   -- np.ndarray of survival probabilities, strike ascending
+    Output: np.ndarray of len(S) + 1 bucket probabilities
+
+    The sum telescopes to exactly 1, so no renormalising is needed. Q1 proved
+    this chain is monotone everywhere, so no bucket can come out negative.
+    Both are asserted anyway -- if either fails, the ladder was assembled in
+    the wrong order.
+    """
+    pmf = np.concatenate([[1.0 - S[0]], -np.diff(S), [S[-1]]])
+    assert np.isclose(pmf.sum(), 1.0), f"pmf sums to {pmf.sum()}, not 1"
+    assert (pmf >= -1e-12).all(), f"negative pmf bucket: {pmf.min()}"
+    return pmf
+
+
+def pmf_bucket_values(strikes, tail_value=Q2_TAIL_VALUE):
+    """The numeric run count each PMF bucket is taken to represent.
+
+    Needed only by the moment calculations. pmf_entropy never calls this,
+    which is the entire reason entropy is the primary metric: the open-ended
+    P(runs >= 12) bucket holds ~15% of the mass and has no defensible numeric
+    value, and entropy is immune to that.
+
+    Input : strikes    -- [2, ..., 12]
+            tail_value -- what to call the '>= 12' bucket, default 13.0
+    Output: np.ndarray of len(strikes) + 1 values, [1, 2, ..., 11, tail_value]
+
+    The head lump 'runs <= 1' is assigned 1. It holds 3.0-3.5% of the mass and
+    the 0-versus-1 split is unknowable, but at that size it cannot move the
+    answer.
+    """
+    head = float(strikes[0] - 1)                      # the "runs <= 1" lump
+    interior = [float(k) for k in strikes[:-1]]       # exactly 2 .. exactly 11
+    return np.array([head] + interior + [float(tail_value)])
+
+
+def pmf_entropy(pmf):
+    """Shannon entropy of the PMF, in bits: -sum(p * log2(p)).
+
+    Zero-probability buckets contribute nothing and are skipped rather than
+    producing -inf. Invariant to what the buckets are CALLED -- it only sees
+    how mass is spread across them -- so it needs no tail assignment at all.
+
+    Input : pmf -- np.ndarray of bucket probabilities
+    Output: float, entropy in bits
+    """
+    p = pmf[pmf > 0]
+    return float(-(p * np.log2(p)).sum())
+
+
+def pmf_mean_and_variance(pmf, values):
+    """E[runs] and Var[runs] together, since both need the same bucket values.
+
+    Input : pmf    -- np.ndarray of bucket probabilities
+            values -- np.ndarray of numeric run counts from pmf_bucket_values
+    Output: (mean, variance) as floats
+
+    Var = sum(v^2 * p) - mean^2. Both figures inherit the tail_value
+    assumption, which is why the sensitivity run varies it over 12 / 13 / 14.
+    """
+    mean = float((pmf * values).sum())
+    variance = float((pmf * values ** 2).sum() - mean ** 2)
+    return mean, variance
+
+
+# ---------------------------------------------------------------- layer 3 ---
+# The walk: one chronological pass over the chain, event by event.
+
+def walk_total_chain(books, freshness_seconds=Q2_FRESHNESS_SECONDS,
+                     tail_value=Q2_TAIL_VALUE):
+    """One chronological pass over the KXMLBTOTAL chain, event by event.
+
+    At each arriving chain event: update that strike's cache entry with its
+    new mid and timestamp, then derive every strike's age as
+    (this event's timestamp - its last_seen). Mean age is recorded
+    unconditionally -- that is metric (3). The PMF is built only if the MAX age
+    is within freshness_seconds: max gates, mean describes.
+
+    Nothing is evaluated until all 11 strikes have been seen at least once
+    (warm-up). There is no resampling and no forward fill -- the cache is a
+    lookup of what we last observed, and the gate is what decides whether that
+    is recent enough to use.
+
+    Input : books             -- full order book DataFrame
+            freshness_seconds -- the gate, default 10.0
+            tail_value        -- passed to pmf_bucket_values, default 13.0
+    Output: DataFrame indexed by recv_ts_utc, one row per chain event, columns
+                mean_staleness  float, seconds, always populated after warm-up
+                max_staleness   float, seconds, always populated after warm-up
+                entropy         float or NaN
+                variance        float or NaN
+                E_runs          float or NaN
+    """
+    strikes = total_chain_strikes(books)
+    values = pmf_bucket_values(strikes, tail_value)
+    names = [f"KXMLB{TOTAL_CHAIN}-{k}" for k in strikes]
+    n_strikes = len(names)
+
+    # Slice the chain out once, in time order, with mids precomputed.
+    b = books.copy()
+    b["market"] = b["native_id"].map(market_short_name)
+    b = b[b["market"].isin(names)].copy()
+    b["recv_ts_utc"] = pd.to_datetime(b["recv_ts_utc"], utc=True)
+    b = b.sort_values("recv_ts_utc")
+    b["mid"] = (b["best_bid"] + b["best_ask"]) / 2.0
+
+    last_seen = {}     # market -> np.datetime64 of its most recent quote
+    mids = {}          # market -> that quote's mid price
+    rows = []
+
+    for ts, market, mid in zip(b["recv_ts_utc"].values,
+                               b["market"].values,
+                               b["mid"].values):
+        last_seen[market] = ts
+        mids[market] = mid
+
+        # Warm-up: we cannot speak about the ladder until we have seen all of it
+        if len(last_seen) < n_strikes:
+            continue
+
+        # Ages are always DERIVED from the stored timestamps, never stored
+        ages = np.array([(ts - last_seen[n]) / np.timedelta64(1, "s")
+                         for n in names])
+        mean_age, max_age = float(ages.mean()), float(ages.max())
+
+        entropy = variance = e_runs = np.nan
+        if max_age <= freshness_seconds:                 # <- the gate
+            pmf = ladder_to_pmf(get_total_ladder(mids, strikes))
+            entropy = pmf_entropy(pmf)
+            e_runs, variance = pmf_mean_and_variance(pmf, values)
+
+        rows.append((ts, mean_age, max_age, entropy, variance, e_runs))
+
+    events = pd.DataFrame(rows, columns=["recv_ts_utc", "mean_staleness",
+                                         "max_staleness", "entropy",
+                                         "variance", "E_runs"])
+    return events.set_index("recv_ts_utc")
+
+
+# ---------------------------------------------------------------- layer 4 ---
+# Aggregate the event stream to one row per minute, then report in two tiers.
+
+def minute_frame(events):
+    """Reduce the event-level frame to one row per one-minute interval.
+
+    entropy, variance and E_runs take the LAST valid observation inside the
+    minute -- the closest analogue to a closing print, and it keeps the
+    first-difference series interpretable as minute-to-minute change. A mean
+    would blur the very repricing we are trying to locate. mean_staleness is
+    the mean over every event in the minute.
+
+    Where no valid PMF could be built anywhere inside the minute, the three
+    PMF columns are NaN. Those NaNs are not missing data to be patched; they
+    are the primary result -- they mark the intervals where the market could
+    not be observed well enough to state an expected number of runs at all.
+
+    Input : events -- the DataFrame from walk_total_chain
+    Output: DataFrame indexed by minute, columns
+                E_runs, entropy, variance, mean_staleness
+    """
+    grouped = events.resample("1min")
+
+    # .last() on a resampler skips NaN, so this is the last VALID observation
+    minutes = pd.DataFrame({
+        "E_runs":         grouped["E_runs"].last(),
+        "entropy":        grouped["entropy"].last(),
+        "variance":       grouped["variance"].last(),
+        "mean_staleness": grouped["mean_staleness"].mean(),
+    })
+    return minutes
+
+
+def tier1_minutes(minutes):
+    """The minutes where no PMF could be built at all, most uncertain first.
+
+    These are the intervals where the chain was too stale to state an expected
+    number of runs -- not imprecisely, but at all -- and they are the
+    top-level answer to Q2. Ranked by mean_staleness descending, because max
+    cannot rank them: among minutes that already failed the gate it is driven
+    by whichever single strike lagged worst, which is the case-A situation the
+    plan rejects.
+
+    Input : minutes -- the DataFrame from minute_frame
+    Output: DataFrame of the all-NaN minutes, sorted by mean_staleness desc
+    """
+    tier1 = minutes[minutes["E_runs"].isna()]
+    return tier1.sort_values("mean_staleness", ascending=False)
+
+
+def tier2_minutes(minutes):
+    """Among the minutes that do carry a PMF, rank them two ways.
+
+    (a) by entropy descending -- the widest belief over outcomes
+    (b) by |change in E_runs from the previous valid minute| descending -- the
+        largest repricing. This is a first difference ALONG the series, not a
+        dispersion statistic within the bin, because within-minute dispersion
+        is exactly zero in 97% of minutes on this data.
+
+    Input : minutes -- the DataFrame from minute_frame
+    Output: DataFrame of the valued minutes with an added d_E_runs column
+    """
+    tier2 = minutes[minutes["E_runs"].notna()].copy()
+    # diff() over the valid rows only, so the gap skips the NaN stretches
+    tier2["d_E_runs"] = tier2["E_runs"].diff()
+    return tier2
+
+
+def plot_q2_series(minutes, figsize=(13, 9)):
+    """Plot the four minute-level columns as four stacked time series.
+
+    Gaps are left as gaps: nothing is interpolated across the NaN stretches,
+    because those stretches ARE the Tier 1 answer. Markers are drawn as well
+    as lines so that an isolated valid minute surrounded by NaN is still
+    visible -- with a line alone it would have no segment to draw and would
+    vanish.
+
+    Input : minutes -- the DataFrame from minute_frame
+    Output: (fig, axes)
+    """
+    import matplotlib.pyplot as plt
+
+    panels = [
+        ("E_runs",         "E[runs]",                    "tab:blue"),
+        ("entropy",        "entropy (bits)",             "tab:orange"),
+        ("variance",       "variance",                   "tab:green"),
+        ("mean_staleness", "mean staleness (seconds)",   "tab:red"),
+    ]
+
+    fig, axes = plt.subplots(len(panels), 1, figsize=figsize, sharex=True)
+    for ax, (col, label, colour) in zip(axes, panels):
+        ax.plot(minutes.index, minutes[col], color=colour,
+                linewidth=0.9, marker=".", markersize=3)
+        ax.set_ylabel(label)
+        ax.grid(alpha=0.3)
+        n_missing = int(minutes[col].isna().sum())
+        ax.set_title(f"{col}   ({len(minutes) - n_missing} of {len(minutes)} "
+                     f"minutes populated, {n_missing} blank)",
+                     fontsize=9, loc="left")
+
+    axes[-1].set_xlabel("recv_ts_utc")
+    fig.suptitle("Q2: uncertainty measures on the KXMLBTOTAL chain, "
+                 "one point per minute", y=0.995)
+    fig.tight_layout()
+    return fig, axes
+
+
+def q2_threshold_sensitivity(books, thresholds=(1.0, 2.0, 5.0, 10.0, 30.0, 60.0)):
+    """Re-run the whole walk at several freshness thresholds and summarise.
+
+    The 10-second default is a judgement call, so the answer's dependence on it
+    is reported rather than assumed away -- the same discipline as the Q1
+    arbitrage sensitivity table.
+
+    Input : books      -- full order book DataFrame
+            thresholds -- seconds to test
+    Output: DataFrame, one row per threshold
+    """
+    rows = []
+    for thr in thresholds:
+        events = walk_total_chain(books, freshness_seconds=thr)
+        minutes = minute_frame(events)
+        valid = events["E_runs"].notna()
+        rows.append({
+            "threshold_s":        thr,
+            "valid_instants":     int(valid.sum()),
+            "pct_of_events":      100.0 * valid.mean(),
+            "minutes_with_value": int(minutes["E_runs"].notna().sum()),
+            "tier1_minutes":      int(minutes["E_runs"].isna().sum()),
+            "entropy_min":        events["entropy"].min(),
+            "entropy_max":        events["entropy"].max(),
+            "E_runs_min":         events["E_runs"].min(),
+            "E_runs_max":         events["E_runs"].max(),
+        })
+    return pd.DataFrame(rows).set_index("threshold_s")
