@@ -864,7 +864,7 @@ def check_arbitrage_violations(books, freshness_seconds=1.0):
     comparison count that forms the denominator.
     """
     b = books.copy()
-    b["recv_ts_utc"] = pd.to_datetime(b["recv_ts_utc"], utc=True, format="ISO8601")
+    b["recv_ts_utc"] = pd.to_datetime(b["recv_ts_utc"], utc=True)
     b["market"] = b["native_id"].map(market_short_name)
     b = b.sort_values("recv_ts_utc")
 
