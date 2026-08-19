@@ -1325,3 +1325,280 @@ def q2_threshold_sensitivity(books, thresholds=(1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
             "E_runs_max":         events["E_runs"].max(),
         })
     return pd.DataFrame(rows).set_index("threshold_s")
+
+
+# ============================================================================
+# Q3 -- "What is the most informed action / series of actions in the dataset?"
+#
+# These functions are for q3.ipynb ONLY -- a separate set from the Q1 and Q2
+# blocks above.
+#
+# The idea: an informed trader with a view on run scoring does not express it
+# in one market. They spray it across correlated strikes and chains. So the
+# unit of analysis is not a trade and not a market -- it is a BASKET of
+# same-direction trades inside one family, landing inside one short window.
+#
+# Two time windows are involved and they are NOT the same thing:
+#   grouping window -- are these trades one action by one person? (1 second)
+#   payoff window   -- did that action turn out to be informed?   (5 minutes)
+# ============================================================================
+
+# The family: three chains that all measure runs scored in this game, over
+# nested windows (1st inning, first 5 innings, whole game). Q1 established the
+# pathwise nesting RFI within F5 within TOTAL. TEAMTOTAL-MIL and TEAMTOTAL-PIT
+# are excluded -- different random variables, and far too illiquid to matter
+# (PIT traded 1,270 contracts across 27 trades in six hours).
+Q3_FAMILY = ("RFI", "F5TOTAL", "TOTAL")
+
+Q3_GROUPING_WINDOW = "1s"      # trades this close together count as one action
+Q3_PAYOFF_MINUTES = 5.0        # how long after to check whether it made money
+Q3_WARMUP_OBS = 50             # prior baskets needed before a score is trusted
+
+
+def family_trades(trades, family=Q3_FAMILY):
+    """Slice the trades frame down to the one family we score.
+
+    Input : trades -- full trades DataFrame
+            family -- tuple of chain names to keep
+    Output: DataFrame with added columns market / chain / strike / ts,
+            sorted by time
+
+    Everything outside the family is dropped here rather than filtered later,
+    so no downstream function has to remember to exclude the team totals.
+    """
+    t = trades.copy()
+    t["market"] = t["native_id"].map(market_short_name)
+    parsed = t["market"].map(parse_chain_and_strike)
+    t["chain"] = parsed.map(lambda x: x[0])
+    t["strike"] = parsed.map(lambda x: x[1])
+    t["ts"] = pd.to_datetime(t["recv_ts_utc"], utc=True)
+    t = t[t["chain"].isin(family)]
+    return t.sort_values("ts").reset_index(drop=True)
+
+
+def build_baskets(t, grouping_window=Q3_GROUPING_WINDOW):
+    """Group trades into baskets: same direction, same bucket of clock time.
+
+    A basket is one candidate "action". Trades join the same basket when they
+    share a direction (aggressor_buy_flag) and fall in the same fixed clock
+    bucket. Buckets are CONSECUTIVE and NON-OVERLAPPING, not a sliding
+    look-back anchored on each trade -- a sliding window would let a single
+    39-print event produce 39 overlapping observations, filling the leaderboard
+    with copies of itself and stuffing the reference distribution with
+    near-duplicates of the very outlier being detected.
+
+    Input : t               -- output of family_trades
+            grouping_window -- pandas offset string, e.g. "1s"
+    Output: DataFrame, one row per basket, sorted by time:
+                ts            bucket start
+                direction     "buy" or "sell" (which side initiated)
+                qty           total contracts in the basket
+                n_trades      how many prints
+                n_markets     how many distinct markets touched
+                n_chains      how many distinct chains touched
+                markets       comma-joined market list
+                vwap          volume-weighted average price
+                span_s        seconds between first and last print
+    """
+    t = t.copy()
+    t["bucket"] = t["ts"].dt.floor(grouping_window)
+
+    g = t.groupby(["bucket", "aggressor_buy_flag"])
+    baskets = pd.DataFrame({
+        "qty":       g["qty"].sum(),
+        "n_trades":  g["qty"].size(),
+        "n_markets": g["market"].nunique(),
+        "n_chains":  g["chain"].nunique(),
+        "markets":   g["market"].apply(lambda s: ", ".join(sorted(set(s)))),
+        # the market carrying most of the basket's size -- this is where the
+        # payoff is measured, since it is where the action actually was
+        "main_market": g.apply(lambda d: d.groupby("market")["qty"].sum().idxmax()),
+        # volume-weighted average price: sum(p*q) / sum(q)
+        "vwap":      g.apply(lambda d: float((d["price"] * d["qty"]).sum()
+                                             / d["qty"].sum())),
+        "span_s":    g["ts"].apply(lambda s: (s.max() - s.min()).total_seconds()),
+    }).reset_index()
+
+    baskets["direction"] = np.where(baskets["aggressor_buy_flag"], "buy", "sell")
+    baskets = baskets.rename(columns={"bucket": "ts"}).drop(columns="aggressor_buy_flag")
+    return baskets.sort_values("ts").reset_index(drop=True)
+
+
+def score_baskets(baskets, warmup=Q3_WARMUP_OBS):
+    """Score each basket against the running distribution of prior baskets.
+
+    Scoring rules, and why each is what it is:
+
+    - The reference distribution uses ONLY PRIOR baskets, never the full
+      sample. That keeps the score honest as a real-time statistic, which is
+      what Q4a will need.
+
+    - It POOLS both directions. A basket must be same-direction to be one
+      actor's action, but the question asked of it -- "is this unusually
+      large?" -- is about size, not side. Splitting by direction starves the
+      buy side, which carries only 24 observations in the first hour.
+
+    - The fence is the Tukey rule Q3 + 1.5*IQR, not mean + k*sigma. The size
+      distribution is extremely fat-tailed, so the large baskets we are hunting
+      inflate the mean and standard deviation themselves, raising the bar and
+      hiding the next one. Quartiles are resistant to exactly that.
+
+    - Baskets before `warmup` prior observations exist are marked unscoreable
+      rather than given a misleading score. A count-based rule means the same
+      thing at every grouping window, unlike an hour of wall-clock time.
+
+    Input : baskets -- output of build_baskets
+            warmup  -- prior observations required before scoring
+    Output: the same frame with added columns
+                run_median   running median of prior basket sizes
+                tukey_fence  running Q3 + 1.5*IQR of prior basket sizes
+                x_median     qty / run_median -- the ranking statistic
+                is_outlier   qty > tukey_fence
+                scoreable    enough prior history to trust the score
+    """
+    q = baskets["qty"].to_numpy()
+    n = len(q)
+    med = np.full(n, np.nan)
+    fence = np.full(n, np.nan)
+
+    # Expanding window: at row i, use rows 0..i-1 only
+    for i in range(warmup, n):
+        prior = q[:i]
+        q1, q3 = np.percentile(prior, [25, 75])
+        med[i] = np.median(prior)
+        fence[i] = q3 + 1.5 * (q3 - q1)
+
+    out = baskets.copy()
+    out["run_median"] = med
+    out["tukey_fence"] = fence
+    out["x_median"] = out["qty"] / out["run_median"]
+    out["is_outlier"] = out["qty"] > out["tukey_fence"]
+    out["scoreable"] = ~np.isnan(fence)
+    return out
+
+
+def add_payoff(baskets, books, payoff_minutes=Q3_PAYOFF_MINUTES,
+               extra_minutes=(1.0, 30.0), freshness_seconds=60.0):
+    """Measure whether each basket actually made money afterwards.
+
+    Large is not the same as informed -- someone can dump 61,000 contracts
+    because they are rebalancing, panicking, or simply wrong. The test is
+    whether the market subsequently moved their way:
+
+        markout = (mid_after - mid_at_action) * (+1 if bought else -1)
+
+    A positive markout in CENTS means the market moved in the initiator's
+    favour, so the action looks informed rather than merely large.
+
+    The mid is taken from the basket's largest market by quantity (main_market,
+    set in build_baskets), since that is where the action actually was. Quotes older than `freshness_seconds` at
+    the measurement point are refused rather than carried forward -- the same
+    discipline as Q1 and Q2 -- so some payoff windows come back NaN. 66% of
+    trades land inside book-feed gaps over 5 seconds, so this matters.
+
+    Input : baskets        -- output of score_baskets
+            books          -- full order book DataFrame
+            payoff_minutes -- the primary horizon that decides, default 5.0
+            extra_minutes  -- reported alongside as context, not deciding
+    Output: the frame with mid_at_action and one markout_{m}min column per
+            horizon, in cents
+    """
+    b = books.copy()
+    b["market"] = b["native_id"].map(market_short_name)
+    b["ts"] = pd.to_datetime(b["recv_ts_utc"], utc=True)
+    b["mid"] = (b["best_bid"] + b["best_ask"]) / 2.0
+    b = b.sort_values("ts")
+
+    # per-market arrays for fast as-of lookup. Timestamps are stripped to naive
+    # UTC datetime64 because a tz-aware Series returns object dtype from
+    # to_numpy(), which searchsorted cannot compare.
+    by_market = {m: (g["ts"].dt.tz_convert(None).to_numpy(), g["mid"].to_numpy())
+                 for m, g in b.groupby("market")}
+
+    def mid_asof(market, when):
+        """Latest mid at or before `when`, or NaN if none / too stale."""
+        if market not in by_market:
+            return np.nan
+        ts_arr, mid_arr = by_market[market]
+        when = np.datetime64(pd.Timestamp(when).tz_convert(None))
+        i = np.searchsorted(ts_arr, when, side="right") - 1
+        if i < 0:
+            return np.nan
+        age = (when - ts_arr[i]) / np.timedelta64(1, "s")
+        return mid_arr[i] if age <= freshness_seconds else np.nan
+
+    out = baskets.copy()
+    out["mid_at_action"] = [mid_asof(m, ts)
+                            for m, ts in zip(out["main_market"], out["ts"])]
+
+    sign = np.where(out["direction"].to_numpy() == "buy", 1.0, -1.0)
+    for mins in (payoff_minutes,) + tuple(extra_minutes):
+        later = out["ts"] + pd.Timedelta(minutes=mins)
+        mid_after = np.array([mid_asof(m, w)
+                              for m, w in zip(out["main_market"], later)])
+        col = f"markout_{mins:g}min"
+        # in cents, positive = market moved the initiator's way
+        out[col] = 100.0 * (mid_after - out["mid_at_action"].to_numpy()) * sign
+    return out
+
+
+def most_informed_actions(trades, books, grouping_window=Q3_GROUPING_WINDOW,
+                          payoff_minutes=Q3_PAYOFF_MINUTES, top=10):
+    """End-to-end: family -> baskets -> scores -> payoff, ranked.
+
+    Ranking is by x_median (size relative to the running median of prior
+    baskets) rather than by raw contract count, so an action is described as
+    "N times the typical basket" rather than an absolute number that means
+    nothing without context.
+
+    Input : trades, books   -- the two raw frames
+            grouping_window -- how close trades must be to count as one action
+            payoff_minutes  -- the horizon that decides whether it made money
+            top             -- how many rows to return
+    Output: (top_n DataFrame, all_baskets DataFrame)
+    """
+    t = family_trades(trades)
+    baskets = build_baskets(t, grouping_window)
+    baskets = score_baskets(baskets)
+    baskets = add_payoff(baskets, books, payoff_minutes)
+
+    ranked = (baskets[baskets["scoreable"] & baskets["is_outlier"]]
+              .sort_values("x_median", ascending=False))
+    return ranked.head(top), baskets
+
+
+def grouping_window_robustness(trades, books, windows=("1s", "5s", "30s", "5min")):
+    """Re-run the whole pipeline at several grouping windows.
+
+    The grouping window encodes an unverifiable assumption about the trader's
+    execution technology -- 1 second catches anyone working through an API, a
+    human clicking a UI might take five minutes. Since it cannot be validated,
+    the next best thing is to show whether the answer depends on it.
+
+    NOTE: the reference distribution is rebuilt at each window, so scores are
+    NOT comparable across windows. Only the identity of the winner is.
+
+    Input : trades, books -- the two raw frames
+            windows       -- grouping windows to test
+    Output: DataFrame, one row per window, naming the top-ranked action
+    """
+    rows = []
+    for w in windows:
+        top, allb = most_informed_actions(trades, books, grouping_window=w, top=1)
+        if len(top) == 0:
+            rows.append({"grouping_window": w, "winner_ts": None})
+            continue
+        r = top.iloc[0]
+        rows.append({
+            "grouping_window": w,
+            "n_baskets":       len(allb),
+            "winner_ts":       r["ts"],
+            "direction":       r["direction"],
+            "qty":             r["qty"],
+            "n_trades":        r["n_trades"],
+            "n_markets":       r["n_markets"],
+            "n_chains":        r["n_chains"],
+            "x_median":        r["x_median"],
+            "markout_5min":    r.get("markout_5min", np.nan),
+        })
+    return pd.DataFrame(rows).set_index("grouping_window")
