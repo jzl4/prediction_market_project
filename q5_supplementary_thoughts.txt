@@ -1,0 +1,111 @@
+################ Market-making ####################
+
+For a market-maker, the best way to offload inventory is to skew your bid and ask quotes. If the market is quoting $0.30 bid / $0.31 offer, and you have some inventory of "yes" contracts that you bought, which you would like to sell out of, you make your price lower, such as $0.305, to see if someone will meet you at mid. If you have some model or informational edge that allows you to see that the market will indeed move down, you can even offer at that bid of $0.30, and you will end up selling at a lower price, in exchange for offloading your inventory. 
+
+So any market-maker needs some type of model to make a prediction on the short-term movements in the market (the next 5 min, the next 30 min, etc), and skew bid & ask quotes accordingly to accumulate or offload inventory
+
+Also, quotes should go wider as expiration / resolution of the event gets closer.  A higher chance of gap risk favors being more conservative with risk-taking, to make sure that your inventory doesn't crash down during a sudden jolt in the market
+
+
+
+
+
+
+############## If the no-arbitrage conditions in Q1 are close to being violated ################
+
+If the no-arbitrage conditions in Q1 are close to being violated, we can trade on those, to bet that those will widen back out.  For instance, we know that P(runs >= 4) should be greater than P(runs >= 5) for the same family/ladder of contracts.  We take the difference between those as before, between the survival functions or CDFs, to get the marginal density (PMFs) at every single point, i.e. - P(runs equals exactly 4). If the survival functions trade too close to each other, which means that P(runs equals exactly 4) gets too low, we can bet on this widening out again in the near future, by buying P(runs >= 4) and selling P(runs >= 5) against it in an RV trade.
+
+In reality, we don't have to wait until these two contracts get too close to each other and the diff goes to zero.  We just need to bet that their gap is too low relative to history.  For instance, if the distribution of the gap is something like a mean of 0.2, with a standard deviation of 0.05, and we see that the gap trades down to 0.1, that's already a 2 stdev observation relative to its long-term history, and that's a signal for buying in anticipation that it will go back up.  Buying the spread is actually selling one leg of 1 contract and buying one leg of the other contract, mathematically, so you would skew your quotes accordingly for the 4-strike and 5-strike to trade this outlier level.
+
+This applies to all such no-arbitrage conditions in the family of chains that we discussed in Q1.
+
+
+
+
+
+
+############ The relationship between the team scores and the total (sum of both teams) ###############
+
+This analysis was suggested by Claude Code - worth considering:
+
+P(total ≥ n) ≥ max(P(MIL ≥ n), P(PIT ≥ n)). That holds because runs are non-negative — if Milwaukee alone scores 4, the game total is automatically ≥ 4.
+
+For the upper bound, though, the total is actually a random variable Z = X + Y (the sum of runs from the individual teams), which is a convolution
+
+In baseball, what is the shape of the distributions for X and Y closest to? If X ~ Poisson(l1) and Y ~ Poisson(l2) then Z ~ Poisson(l1+l2). If binomial with same p, Z ~ Binomial(n1+n2, p). But this assumes
+independence, and team scores may be correlated. I'd like to use independence as a first-order approximation via convolution.
+
+The convolution logic is exactly right, including both closure results (Poisson closure
+holds generally; the binomial one requires the SAME p, which is why n1+n2 works - it's just
+pooling Bernoulli trials).
+
+The answer to "what shape" is: NOT Poisson, and not binomial - NEGATIVE BINOMIAL.
+And our own ladders prove it.
+
+The three classic discrete distributions are distinguished by variance-to-mean ratio:
+
+    Binomial             var/mean < 1     underdispersed
+    Poisson              var/mean = 1     the reference case
+    Negative binomial    var/mean > 1     overdispersed
+
+Fitting each market-implied ladder by least squares on the survival points:
+
+    MIL (team)   Poisson: lam=3.75              RMSE=0.0599
+                 NegBin : mean=3.89  var=7.29   var/mean=1.87   RMSE=0.0048  (12x better)
+
+    PIT (team)   Poisson: lam=3.48              RMSE=0.0643
+                 NegBin : mean=3.63  var=7.18   var/mean=1.98   RMSE=0.0033  (19x better)
+
+    GAME TOTAL   Poisson: lam=7.29              RMSE=0.0666
+                 NegBin : mean=7.52  var=15.89  var/mean=2.11   RMSE=0.0092  (7x better)
+
+    FIRST 5      Poisson: lam=3.80              RMSE=0.0668
+                 NegBin : mean=4.04  var=8.62   var/mean=2.13   RMSE=0.0078  (9x better)
+
+Every ladder lands at var/mean ~ 1.9-2.1. Baseball runs have roughly TWICE the variance a
+Poisson would allow. The negative binomial fits to RMSE 0.003-0.009 - under one cent, which
+is inside the bid-ask spread, so it's fitting as well as the data can resolve.
+
+--------------------------------------------------------------------------------
+THE CONVOLUTION TEST - THIS IS THE PAYOFF
+--------------------------------------------------------------------------------
+
+Fit each team separately, convolve, compare to the market's independently-quoted game total:
+
+           market S(n)   Poisson conv     NegBin conv
+    n= 4        0.845      0.930 (+.085)   0.867 (+.022)
+    n= 7        0.565      0.584 (+.019)   0.560 (-.005)
+    n= 9        0.365      0.302 (-.063)   0.354 (-.011)
+    n=12        0.145      0.065 (-.080)   0.146 (+.001)
+
+    mean |error|             0.0601          0.0104
+    implied E[Z]             7.23            7.52
+
+The negative binomial convolution reproduces the ENTIRE game-total ladder to about ONE CENT
+- inside the spread, so it's consistent with the market to the limit of measurement. Poisson
+is six times worse and wrong SYSTEMATICALLY: too fat in the middle, far too thin in the tail.
+At n=12 it says 0.065 where the market says 0.145 - less than half. That tail error is
+precisely the overdispersion being thrown away.
+
+TWO CONSTRAINTS COME OUT CLEAN:
+
+(a) MEANS ADD EXACTLY.  MIL 3.89 + PIT 3.63 = 7.52, and the game total fitted independently
+    gives 7.52. Additivity holding to two decimals across separately-quoted markets.
+
+(b) WE CAN BACK OUT THE CORRELATION.  Since Var(X+Y) = Var(X) + Var(Y) + 2*Cov(X,Y):
+
+        7.29 + 7.18 = 14.47   (what independence would give)
+                      15.89   (what the game-total ladder implies)
+
+    The gap implies Cov ~ 0.71, so RHO ~ +0.10. The market is pricing a small POSITIVE
+    correlation between the two teams' scores - which makes baseball sense: both teams share
+    the ballpark, the weather and wind, the umpire's strike zone, and the general run
+    environment of the night. Slugfests and pitchers' duels both tend to be mutual.
+
+    So independence isn't exact, but now we have a number for how wrong it is: small enough
+    that the first-order convolution is a genuinely good approximation, which is why the
+    NegBin convolution came within a cent.
+
+This isn't one of the questions asked, but I thought that one way we can make money in baseball outcome market-making is by looking at historical data on how baseball games have played out, to get an estimate of what the correlation between 2 teams' runs looks like - which will resolve the question of how to calculate the convolution of the sum Z = X + Y where X and Y are the individual team scores, allowing us to price a more accurate estimate for what the game total should be relative to the individual team markets - does that make sense at all? 
+
+
