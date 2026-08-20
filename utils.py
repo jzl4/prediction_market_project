@@ -471,16 +471,32 @@ def max_size_at_var(sweep, thresholds=(0.01, 0.05, 0.10)):
 
 
 def simulate_pnl_paths(bet_size, n_trades=32_000, win_prob=0.55,
-                       n_paths=40, seed=0):
+                       n_paths=40, seed=0, loss_limit=-1000.0, stop_at_ruin=True):
     """The same walk as simulate_naive_random_walk, but keeping the whole path.
 
-    Returns an (n_paths, n_trades) array of cumulative P&L, so the wiggle can be
-    plotted rather than just summarised. Keep n_paths small -- this holds every
-    step in memory, unlike the batched summary version.
+    Returns an (n_paths, n_trades) array of cumulative P&L so the wiggle can be
+    plotted. Keep n_paths small -- this holds every step in memory, unlike the
+    batched summary version.
+
+    stop_at_ruin matches the summary simulation: once a path touches the floor
+    the trader is stopped out, so the line goes flat at the value of the trade
+    that broke the limit and stays there. Without this the chart shows paths
+    sinking to -$2,500 and then recovering to $600,000, which is money nobody
+    could have collected -- they were already out of a job at -$1,000.
     """
     rng = np.random.default_rng(seed)
     steps = np.where(rng.random((n_paths, n_trades)) < win_prob, bet_size, -bet_size)
-    return np.cumsum(steps, axis=1)
+    pnl = np.cumsum(steps, axis=1)
+
+    if stop_at_ruin:
+        below = pnl <= loss_limit
+        hit   = below.any(axis=1)
+        first = below.argmax(axis=1)              # meaningless where ~hit, masked below
+        at_ruin = pnl[np.arange(n_paths), first]
+        frozen  = hit[:, None] & (np.arange(n_trades)[None, :] >= first[:, None])
+        pnl = np.where(frozen, at_ruin[:, None], pnl)
+
+    return pnl
 
 
 def plot_pnl_paths(paths, loss_limit=-1000.0, zoom=1000, max_points=2000, axes=None):
