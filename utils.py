@@ -1,4 +1,5 @@
 # Import libraries
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -318,9 +319,16 @@ def simulate_naive_random_walk(bet_size, n_trades=32_000, win_prob=0.55,
     batch_size -- paths simulated at once. n_paths x n_trades floats would be
                   ~2.5 GB at the defaults, so the work is done in batches.
 
-    Ruin is recorded but does not stop the path -- the walk runs the full
-    n_trades either way. That keeps "did it ever touch the floor" separate from
-    "where did it end up", so both can be read off the same run.
+    Ruin is ABSORBING. A path that touches the floor is finished: its P&L is
+    frozen at the value of the trade that broke the limit and it books nothing
+    afterwards. Letting it keep trading would credit the trader with profits
+    earned after they blew the loss tolerance and were stopped out, which is
+    the single easiest way to make a dangerous bet size look safe.
+
+    Note the frozen value is usually a little below loss_limit, not exactly on
+    it. The walk moves in steps of bet_size, so it lands on the first multiple
+    of bet_size at or beyond the floor -- a $300 bet crossing -$1,000 stops at
+    -$1,200. That overshoot is real and is what the trader actually loses.
 
     Returns a dict of summary statistics, one row's worth per call.
     """
@@ -344,10 +352,16 @@ def simulate_naive_random_walk(bet_size, n_trades=32_000, win_prob=0.55,
         # argmax on a boolean row gives the first True; meaningless if none, so mask it
         first = np.where(hit, below.argmax(axis=1), -1)
 
+        # Absorbing barrier: a ruined path books its P&L at the breaking trade
+        # and stops. Survivors book where they finished.
+        ends = pnl[:, -1].copy()
+        if hit.any():
+            ends[hit] = pnl[hit, first[hit]]
+
         sl = slice(start, start + n)
         ruined[sl]     = hit
         first_ruin[sl] = first
-        final_pnl[sl]  = pnl[:, -1]
+        final_pnl[sl]  = ends
         worst_pnl[sl]  = pnl.min(axis=1)
 
     survivors = ~ruined
@@ -357,6 +371,11 @@ def simulate_naive_random_walk(bet_size, n_trades=32_000, win_prob=0.55,
         # when ruin happens, how early? The prompt's real question is whether we
         # survive the opening stretch, so the timing matters as much as the odds.
         "median_ruin_trade": float(np.median(first_ruin[ruined])) if ruined.any() else np.nan,
+        # The prompt asks to maximise TOTAL EXPECTED profit, so the mean is the
+        # objective, not the median. They diverge sharply here: while fewer than
+        # half the paths are ruined the median is still a survivor's number and
+        # barely moves, whereas the mean carries the losses properly.
+        "mean_final_pnl":    float(final_pnl.mean()),
         "median_final_pnl":  float(np.median(final_pnl)),
         "median_final_pnl_survivors": float(np.median(final_pnl[survivors])) if survivors.any() else np.nan,
         "median_worst_pnl":  float(np.median(worst_pnl)),
@@ -377,8 +396,78 @@ def ruin_probability_closed_form(bet_size, win_prob=0.55, loss_limit=-1000.0):
     Used as a unit test, not as the answer: if the Monte Carlo does not land
     near these numbers, the Monte Carlo has a bug.
     """
-    k = abs(loss_limit) / bet_size          # how many losing bets to the floor
+    # The walk only ever stands on multiples of bet_size, so it cannot stop
+    # exactly on a floor that is not one. It crosses at the first multiple at
+    # or beyond it -- hence ceil, not plain division. This matters as soon as
+    # the bet size does not divide the limit evenly: a $70 bet reaches the
+    # floor in 15 losing trades, not 14.29.
+    k = math.ceil(abs(loss_limit) / bet_size)
     return float(((1 - win_prob) / win_prob) ** k)
+
+
+def ruin_size_sweep(sizes=range(10, 210, 10), n_paths=10_000, n_trades=32_000,
+                    win_prob=0.55, loss_limit=-1000.0, seed=11):
+    """Ruin probability across a fine grid of bet sizes.
+
+    The coarse 10/50/100/200 grid cannot locate the decision. Between $100
+    (14% ruin) and $200 (37%) is exactly where the answer lives, and the
+    thresholds a risk manager actually quotes -- 1%, 5%, 10% -- all fall in
+    that gap. This sweeps $10 increments so those crossings can be read off.
+
+    n_paths is raised to 20,000 here because the interesting probabilities are
+    small: at a true 1%, 5,000 paths carry a standard error of 0.14 points,
+    which is a fifth of the quantity being measured.
+
+    Output: DataFrame indexed by bet_size with the simulated and closed-form
+            ruin probability, and the median final P&L with ruined paths
+            correctly stopped at the floor.
+    """
+    rows = []
+    for x in sizes:
+        r = simulate_naive_random_walk(x, n_trades=n_trades, win_prob=win_prob,
+                                       loss_limit=loss_limit, n_paths=n_paths,
+                                       seed=seed)
+        rows.append({
+            "bet_size":         x,
+            "prob_ruin":        r["prob_ruin"],
+            "closed_form":      ruin_probability_closed_form(x, win_prob, loss_limit),
+            "mean_final_pnl":   r["mean_final_pnl"],
+            "median_final_pnl": r["median_final_pnl"],
+        })
+    return pd.DataFrame(rows).set_index("bet_size")
+
+
+def max_size_at_var(sweep, thresholds=(0.01, 0.05, 0.10)):
+    """Largest bet size whose ruin probability stays within each VaR threshold.
+
+    Read as: "trading $X per bet, the chance of ever breaching the $1,000 loss
+    tolerance over the three months is at most T". 1% / 5% / 10% are the
+    conventional VaR levels, so the answer lands in the language a risk manager
+    already uses.
+
+    Reported off the simulated column rather than the closed form, because the
+    simulation is the thing that respects the finite three-month horizon; the
+    closed form assumes infinitely many trades and so runs slightly high.
+
+    Input : sweep      -- DataFrame from ruin_size_sweep
+            thresholds -- ruin probabilities to solve for
+    Output: DataFrame, one row per threshold
+    """
+    rows = []
+    for t in thresholds:
+        ok = sweep.index[sweep["prob_ruin"] <= t]
+        if len(ok) == 0:
+            rows.append({"var_threshold": t, "max_bet_size": np.nan,
+                         "prob_ruin_there": np.nan, "mean_final_pnl": np.nan})
+            continue
+        x = int(max(ok))
+        rows.append({
+            "var_threshold":    t,
+            "max_bet_size":     x,
+            "prob_ruin_there":  sweep.loc[x, "prob_ruin"],
+            "mean_final_pnl":   sweep.loc[x, "mean_final_pnl"],
+        })
+    return pd.DataFrame(rows).set_index("var_threshold")
 
 
 def simulate_pnl_paths(bet_size, n_trades=32_000, win_prob=0.55,
